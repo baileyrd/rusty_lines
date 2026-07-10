@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Releases are git-based (tag + GitHub release), not published to
+  crates.io: `publish = false` in Cargo.toml, and `docs/RELEASING.md`
+  reworked accordingly (the crates.io section replaced by a downstream
+  rush harness check).
 - Menu cycling: Tab after the candidate list walks the candidates
   in-line, wrapping around (zsh `AUTO_MENU`, readline `menu-complete`) —
   revisiting a narrowing; the paging/menu-select UI stays declined.

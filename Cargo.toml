@@ -8,6 +8,9 @@ description = "A hand-rolled readline alternative: emacs + vi keymaps, kill ring
 repository = "https://github.com/baileyrd/rusty_lines"
 keywords = ["readline", "line-editor", "repl", "terminal", "cli"]
 categories = ["command-line-interface"]
+# Git-based releases only (tags + GitHub releases); consumers use the git
+# dependency. See docs/RELEASING.md.
+publish = false
 
 [dependencies]
 # Display-column widths for the render engine — Unicode tables only.
