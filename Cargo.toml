@@ -18,3 +18,8 @@ unicode-width = "0.2"
 # fall back to a plain buffered read.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# The pty end-to-end tests (tests/pty.rs) drive examples/demo under a
+# pseudo-terminal.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
