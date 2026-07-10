@@ -56,7 +56,10 @@ that fallback compiling.
 The README's "Deliberate narrowings" section lists features that are
 intentionally NOT supported (multi-line buffer editing, programmable
 keybindings, keyboard macros, completion paging, …). Don't add them without
-being asked.
+being asked. `docs/survey.md` is the fuller per-editor audit behind the
+README's feature matrix — when adding or declining a capability, update the
+matrix in both files and name the reference editor whose semantics are
+matched.
 
 ## Testing conventions
 

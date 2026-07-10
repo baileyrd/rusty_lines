@@ -41,7 +41,9 @@ Try it: `cargo run --example demo`.
 The feature set was audited against the line editors in wide use — GNU
 readline, libedit, zsh ZLE, fish, ksh93's emacs/vi modes, linenoise,
 replxx, rustyline, reedline, prompt_toolkit/PSReadLine — and the gaps
-closed. References are to the editor whose behavior is matched.
+closed. References are to the editor whose behavior is matched. The
+full per-editor survey behind this table is in
+[docs/survey.md](docs/survey.md).
 
 | Capability | Reference behavior |
 |---|---|
