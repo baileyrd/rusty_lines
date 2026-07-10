@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Menu cycling: Tab after the candidate list walks the candidates
+  in-line, wrapping around (zsh `AUTO_MENU`, readline `menu-complete`) —
+  revisiting a narrowing; the paging/menu-select UI stays declined.
+- Resize while idle at the prompt now repaints within a poll tick
+  (~200ms), without a SIGWINCH handler. The idle tick also calls
+  `Hooks::on_interrupted_read`, so pending host traps fire promptly even
+  with no input arriving.
+- History dedup option: `Editor::set_history_dedup` erases earlier
+  duplicates on add (bash `HISTCONTROL=erasedups`, fish). Off by default.
+- Revert line: M-r undoes every edit to the line at once (readline
+  `revert-line`).
+- New `examples/hooked.rs` (completion + hints demo) used by new pty
+  tests for menu cycling, hint acceptance, and idle-resize repaint.
 - `docs/RELEASING.md`: release checklist (crates.io blockers, MSRV sync
   points, tag/publish steps).
 - History cap: `Editor::set_max_history_len` (readline `stifle_history`,

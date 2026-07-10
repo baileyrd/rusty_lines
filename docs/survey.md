@@ -34,11 +34,13 @@ psql, and hundreds of others link it.
   the vi keymap tradition (below, shared with ksh); list-style completion
   (`CompletionType::List`: longest-common-prefix insertion, then a
   columned candidate list); C-l clear-screen; the history cap
-  (`stifle_history` / bash `HISTSIZE`) and bash's `histappend`
-  append-only persistence.
+  (`stifle_history` / bash `HISTSIZE`), bash's `histappend`
+  append-only persistence and `HISTCONTROL=erasedups` dedup (opt-in),
+  and `revert-line` (M-r).
 - **Declined:** `.inputrc` programmable keybindings; keyboard macros
   (C-x `(` … C-x `)`); emacs-mode numeric arguments (M-digit, C-u);
-  mark/region (C-@, C-x C-x); menu-complete.
+  mark/region (C-@, C-x C-x). (`menu-complete` was initially declined,
+  then adopted as repeated-Tab cycling — see the matrix.)
 
 ### libedit (editline)
 
@@ -58,7 +60,9 @@ The most featureful shell editor; everything is a widget bound in
   (`history-beginning-search-backward/-forward`, here on
   PageUp/PageDown and M-p/M-n); forward incremental search being a
   first-class peer of backward (which requires IXON off so C-s reaches
-  the editor); case ops and insert-last-argument parity with readline.
+  the editor); repeated-Tab candidate cycling after the list (`AUTO_MENU`,
+  without the highlighted menu-select UI); case ops and
+  insert-last-argument parity with readline.
 - **Declined:** user-defined widgets and rebindable keymaps; the
   editable multi-line buffer (ZLE moves the cursor across embedded
   newlines); menu-select completion; ZLE's undo *and redo* pair (redo
@@ -161,7 +165,7 @@ the README; kept in both places deliberately.)
 | Kill ring: C-k, C-u, C-w, M-d, M-Backspace kill *into* a ring; C-y yanks; M-y rotates; consecutive kills grow one entry (append forward / prepend backward); ring survives across lines | readline, ZLE, fish |
 | Word flavors: M-b/M-f/M-d/M-Backspace use alphanumeric words, C-w whitespace words (unix-word-rubout) | readline's two word classes |
 | Ctrl-arrow / Alt-arrow word motion (`CSI 1;5C` etc.) | every modern terminal editor |
-| Undo: C-_ , C-x C-u (and C-z, fish-style); runs of self-insert undo as one unit | readline, ZLE, fish |
+| Undo: C-_ , C-x C-u (and C-z, fish-style); runs of self-insert undo as one unit; M-r reverts the whole line | readline (incl. `revert-line`), ZLE, fish |
 | Transpose: C-t chars (two-before at EOL), M-t words | readline |
 | Case ops: M-u / M-l / M-c | readline, ZLE |
 | Insert last argument: M-. / M-_ , repeat cycles older entries | readline, ZLE |
@@ -169,6 +173,7 @@ the README; kept in both places deliberately.)
 | Edit line in `$VISUAL`/`$EDITOR`: C-x C-e (emacs), `v` (vi normal); result returned as the line | readline, ZLE, fish (Alt-e) |
 | History: Up/Down with draft preservation, C-p/C-n, M-< / M-> | readline |
 | History cap: `set_max_history_len` drops oldest past the limit | readline `stifle_history`, bash `HISTSIZE` |
+| History dedup option: `set_history_dedup` erases earlier duplicates | bash `HISTCONTROL=erasedups`, fish |
 | History persistence: `save_history` rewrites, `append_history` appends only new entries; `load_history` tolerates a rustyline `#V2` header | bash `histappend`; rustyline migration |
 | Clear screen: C-l clears and repaints the edit region at the top | readline `clear-screen` |
 | Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search | readline, ZLE |
@@ -176,11 +181,13 @@ the README; kept in both places deliberately.)
 | History hints (autosuggestions) via `Hooks::hint`, Right/End accepts; M-f / Ctrl-Right at end of line accepts one word | fish, PSReadLine, linenoise hints |
 | Syntax highlighting while typing via `Hooks::highlight` | fish, ZLE plugins, replxx |
 | Tab completion via `Hooks::complete`: LCP insertion + columned candidate list | readline `CompletionType::List` |
+| Menu cycling: Tab after the candidate list walks the candidates in-line, wrapping around | zsh `AUTO_MENU`, readline `menu-complete` |
 | Abbreviation expansion on space via `Hooks::expand_abbreviation` | fish `abbr` |
 | Right-side prompt, hidden when the line grows into it | zsh `$RPS1`, fish, reedline |
 | Bracketed paste: paste arrives as one event — tabs/ESC insert literally, nothing executes until Enter; multi-line pastes keep their newlines (shown `⏎`) and return as a unit; multi-line history entries stored joined with `; ` (bash `cmdhist`) | readline 8.1+, ZLE, fish, reedline |
 | vi mode (`Hooks::vi_mode`): counts; `d`/`c`/`y` operators over motions; `h l 0 ^ $ w W b B e E f F t T ; ,`; `x X D C s S Y r ~ p P u`; `i I a A`; `k`/`j` history; `cw`≡`ce` quirk; Esc backs the cursor up one | readline vi mode, ksh, ZLE |
 | Wide chars + UTF-8 input assembly; ANSI-aware width math; soft-wrap repaint; `^X` control-char visualization keeps cursor math exact | all modern |
+| Resize: width re-read on every repaint; a resize while idle at the prompt repaints within a poll tick (~200ms) | readline SIGWINCH, approximated without signals |
 
 ## Deliberate narrowings
 
@@ -201,13 +208,16 @@ either niche, terminal-hostile, or a different program's job:
   has none either — readline semantics win).
 - **vi registers, `.` repeat, `/` history search** (C-r covers search
   from insert mode; the unnamed register is the kill ring).
-- **Completion paging/menu-select** (fish's pager, ZLE menu-select,
-  reedline/prompt_toolkit menus): long candidate lists print unpaged.
-- **Eager SIGWINCH repaint** (readline repaints the moment the window
-  resizes). The width is re-read from the tty on every repaint, so the
-  next keystroke self-heals; installing a signal handler from a library
-  is the host's business, not the editor's — the host already owns
-  signal delivery via `Hooks::on_interrupted_read`.
+- **Completion paging and menu-select UI** (fish's pager, ZLE's
+  interactive menu with a highlighted selection, reedline/prompt_toolkit
+  menus): long candidate lists print unpaged; repeated-Tab cycling (see
+  the matrix) stands in for menu-select.
+- **Signal-driven resize repaint** (readline installs a SIGWINCH
+  handler). The width is re-read from the tty on every repaint, and a
+  resize while idle at the prompt is noticed by the input poll tick and
+  repainted; only the signal handler itself is declined — installing
+  one from a library is the host's business, not the editor's, and the
+  host already owns signal delivery via `Hooks::on_interrupted_read`.
 - **Grapheme-cluster cursor math** (combining marks, emoji ZWJ
   sequences). Width is per-`char` via `unicode-width`; getting clusters
   right would add a `unicode-segmentation` dependency against the
