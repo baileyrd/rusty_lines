@@ -1,7 +1,18 @@
 # Release checklist
 
-Steps to cut a `rusty_lines` release. Work through them in order; each
-release should be a PR like any other change.
+Steps to cut a `rusty_lines` release. Releases are git-based — a tag
+plus a GitHub release; the crate is **not** published to crates.io
+(`publish = false` in Cargo.toml enforces this). Consumers depend on
+the git repository, as rush does:
+
+```toml
+rusty_lines = { git = "https://github.com/baileyrd/rusty_lines", branch = "main" }
+# or, pinned to a release:
+rusty_lines = { git = "https://github.com/baileyrd/rusty_lines", tag = "vX.Y.Z" }
+```
+
+Work through the steps in order; each release should be a PR like any
+other change.
 
 ## 1. Pre-flight
 
@@ -25,20 +36,12 @@ release should be a PR like any other change.
       entry that last changed it.
 - [ ] The feature matrix is identical in `README.md` and
       `docs/survey.md` (they are deliberately duplicated).
+- [ ] Downstream check: point rush at the release candidate revision
+      (`cargo update -p rusty_lines` in rush), `cargo build`, and run
+      its pty harness — `python3 tests/pty/editor_pty_test.py`, all
+      scenarios must pass.
 
-## 2. crates.io blockers
-
-- [ ] **The `rusty_libc` git dependency must go.** crates.io rejects
-      git dependencies, even optional ones. Either:
-      - publish `rusty_libc` to crates.io first and switch to
-        `rusty_libc = { version = "...", optional = true }`, or
-      - drop the optional dependency (and the `rusty-libc` feature +
-        CI job) for this release and restore it afterwards.
-- [ ] `cargo package --list` — check nothing unexpected ships and
-      nothing needed is missing.
-- [ ] `cargo publish --dry-run` passes.
-
-## 3. Version bump (as a PR)
+## 2. Version bump (as a PR)
 
 - [ ] Bump `version` in `Cargo.toml`. Pre-1.0 semver: breaking changes
       bump the minor version. (`save_history` taking `&mut self` since
@@ -47,7 +50,7 @@ release should be a PR like any other change.
       add a fresh empty `## Unreleased` above it.
 - [ ] Open the release PR, wait for CI, merge, sync.
 
-## 4. Tag and publish
+## 3. Tag and release
 
 - [ ] Tag the merge commit and push the tag:
 
@@ -55,16 +58,11 @@ release should be a PR like any other change.
   git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
   ```
 
-- [ ] `cargo publish`
 - [ ] Create a GitHub release for the tag, body = that version's
       CHANGELOG section.
 
-## 5. Post-release
+## 4. Post-release
 
-- [ ] Verify the docs.rs build succeeded and the crate page renders
-      (README, badges, feature docs).
-- [ ] Point [rush](https://github.com/baileyrd/rush) at the released
-      version instead of a path/git dependency, and run its downstream
-      pty harness against it.
-- [ ] If the `rusty_libc` dependency was dropped in step 2, restore it
-      on `main`.
+- [ ] Repin rush to the released tag (or let its `branch = "main"`
+      dependency pick it up with `cargo update -p rusty_lines`) and
+      re-run its pty harness.
