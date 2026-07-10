@@ -5,9 +5,10 @@
 //! byte `read`, and the window size. Two backends provide it behind one
 //! interface:
 //!
-//! - **default** — the `libc` crate (portable across every Unix).
-//! - **`rusty-libc` feature** — the hand-rolled raw-syscall crate (Linux
-//!   only; zero third-party deps).
+//! - **`rusty_libc`** — the hand-rolled raw-syscall crate; the default on
+//!   Linux (zero third-party deps).
+//! - **`libc` crate** — the backend on other Unix, and on Linux when forced
+//!   with `--no-default-features --features libc-backend`.
 //!
 //! All functions target the streams the editor uses directly: stdin (fd 0)
 //! for input and raw mode, stdout (fd 1) for the window size.
@@ -21,11 +22,20 @@
 
 pub use imp::*;
 
-#[cfg(all(unix, not(feature = "libc-backend"), not(feature = "rusty-libc")))]
-compile_error!("enable one terminal backend: the default `libc-backend`, or `rusty-libc`");
+// Backend selection is target-driven: `rusty_libc` on Linux (the default),
+// `libc` on other Unix. `libc-backend` forces libc on Linux too.
+#[cfg(all(
+    target_os = "linux",
+    not(feature = "rusty-libc"),
+    not(feature = "libc-backend")
+))]
+compile_error!("no backend: enable the default `rusty-libc`, or `libc-backend`");
 
-// ---- libc backend (default) ----------------------------------------------
-#[cfg(all(feature = "libc-backend", not(feature = "rusty-libc")))]
+// ---- libc backend: other Unix, or Linux with `libc-backend` --------------
+#[cfg(any(
+    all(unix, not(target_os = "linux")),
+    all(target_os = "linux", feature = "libc-backend")
+))]
 mod imp {
     use std::io;
 
@@ -108,8 +118,12 @@ mod imp {
     }
 }
 
-// ---- rusty_libc backend (feature = "rusty-libc") -------------------------
-#[cfg(feature = "rusty-libc")]
+// ---- rusty_libc backend: Linux default -----------------------------------
+#[cfg(all(
+    target_os = "linux",
+    feature = "rusty-libc",
+    not(feature = "libc-backend")
+))]
 mod imp {
     use rusty_libc::{Errno, fd, termios, tty};
     use std::io;
