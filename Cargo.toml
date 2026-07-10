@@ -1,0 +1,19 @@
+[package]
+name = "rusty_lines"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A hand-rolled readline alternative: emacs + vi keymaps, kill ring, undo, incremental/prefix history search, bracketed paste, completion/hint/highlight hooks, and a right-side prompt."
+repository = "https://github.com/baileyrd/rusty_lines"
+keywords = ["readline", "line-editor", "repl", "terminal", "cli"]
+categories = ["command-line-interface"]
+
+[dependencies]
+# Display-column widths for the render engine — Unicode tables only.
+unicode-width = "0.2"
+
+# Raw terminal mode (termios), poll, and window size are Unix-only; the
+# raw libc bindings are the most stable surface for them. Non-Unix builds
+# fall back to a plain buffered read.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
