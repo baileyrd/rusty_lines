@@ -142,6 +142,12 @@ pub struct Editor {
     history: Vec<String>,
     /// The kill ring (readline's): survives across lines within a session.
     kill_ring: Vec<String>,
+    /// Cap on history entries (readline's `stifle_history`); oldest are
+    /// dropped past it. `usize::MAX` = unbounded, the default.
+    max_history: usize,
+    /// How many history entries are already in the history file, so
+    /// `append_history` writes only the ones added since.
+    persisted: usize,
 }
 
 /// The piped-stdin path: one line, no prompt, no editing.
@@ -180,6 +186,25 @@ impl Editor {
         Editor {
             history: Vec::new(),
             kill_ring: Vec::new(),
+            max_history: usize::MAX,
+            persisted: 0,
+        }
+    }
+
+    /// Cap the history at `n` entries (readline's `stifle_history`,
+    /// bash's `HISTSIZE`): the oldest entries are dropped as new ones
+    /// arrive. Applies immediately and to future `add_history_entry`
+    /// calls. The default is unbounded.
+    pub fn set_max_history_len(&mut self, n: usize) {
+        self.max_history = n;
+        self.trim_history();
+    }
+
+    fn trim_history(&mut self) {
+        if self.history.len() > self.max_history {
+            let excess = self.history.len() - self.max_history;
+            self.history.drain(..excess);
+            self.persisted = self.persisted.saturating_sub(excess);
         }
     }
 
@@ -199,6 +224,7 @@ impl Editor {
         };
         if self.history.last() != Some(&entry) {
             self.history.push(entry);
+            self.trim_history();
         }
     }
 
@@ -215,12 +241,32 @@ impl Editor {
                 self.add_history_entry(line);
             }
         }
+        self.persisted = self.history.len();
         Ok(())
     }
 
     /// Write the history to `path`, one entry per line.
-    pub fn save_history(&self, path: &std::path::Path) -> io::Result<()> {
-        std::fs::write(path, self.history.join("\n") + "\n")
+    pub fn save_history(&mut self, path: &std::path::Path) -> io::Result<()> {
+        std::fs::write(path, self.history.join("\n") + "\n")?;
+        self.persisted = self.history.len();
+        Ok(())
+    }
+
+    /// Append only the entries added since the last `load_history`,
+    /// `save_history`, or `append_history` call — bash's `histappend`:
+    /// concurrent sessions interleave instead of overwriting each other.
+    pub fn append_history(&mut self, path: &std::path::Path) -> io::Result<()> {
+        let new = &self.history[self.persisted.min(self.history.len())..];
+        if !new.is_empty() {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            f.write_all((new.join("\n") + "\n").as_bytes())?;
+        }
+        self.persisted = self.history.len();
+        Ok(())
     }
 
     /// Read one line interactively. `rprompt` is the already-expanded
@@ -620,7 +666,9 @@ fn read_line_raw(
 ) -> io::Result<ReadResult> {
     let raw = RawMode::enable()?;
     let _paste = BracketedPaste::enable();
-    let Editor { history, kill_ring } = ed;
+    let Editor {
+        history, kill_ring, ..
+    } = ed;
     let mut st = LineState {
         buffer: String::new(),
         cursor: 0,
@@ -838,7 +886,19 @@ fn handle_insert(st: &mut LineState, key: Key, history: &[String], ring: &mut Ve
             st.cursor = st.buffer.len();
         }
         Key::WordLeft | Key::Alt('b') => st.cursor = word_back_alnum(&st.buffer, st.cursor),
-        Key::WordRight | Key::Alt('f') => st.cursor = word_forward_alnum(&st.buffer, st.cursor),
+        Key::WordRight | Key::Alt('f') => {
+            // At end of line, accept one word of the history hint
+            // (fish's forward-word on an autosuggestion).
+            if st.cursor == st.buffer.len() {
+                if let Some(hint) = st.hooks.hint(&st.buffer, history) {
+                    let take = word_forward_alnum(&hint, 0);
+                    st.buffer.push_str(&hint[..take]);
+                    st.cursor = st.buffer.len();
+                }
+            } else {
+                st.cursor = word_forward_alnum(&st.buffer, st.cursor);
+            }
+        }
         Key::Ctrl('k') => kill_span(st, ring, st.cursor, st.buffer.len(), true),
         Key::Ctrl('u') => kill_span(st, ring, 0, st.cursor, false),
         Key::Ctrl('w') => {
@@ -1936,6 +1996,11 @@ mod tests {
 
     #[cfg(unix)]
     fn state(buf: &str, cursor: usize) -> LineState<'static> {
+        state_hooked(buf, cursor, &NoHooks)
+    }
+
+    #[cfg(unix)]
+    fn state_hooked<'a>(buf: &str, cursor: usize, hooks: &'a dyn Hooks) -> LineState<'a> {
         LineState {
             buffer: buf.to_string(),
             cursor,
@@ -1959,7 +2024,7 @@ mod tests {
             this_action: Action::Other,
             yank: None,
             lastarg: None,
-            hooks: &NoHooks,
+            hooks,
         }
     }
 
@@ -2171,5 +2236,63 @@ mod tests {
         assert_eq!(st.buffer, "git push");
         history_prefix_next(&mut st, &history);
         assert_eq!(st.buffer, "git"); // back to the draft
+    }
+
+    #[test]
+    fn history_cap_drops_oldest() {
+        let mut ed = Editor::new();
+        ed.set_max_history_len(2);
+        ed.add_history_entry("a");
+        ed.add_history_entry("b");
+        ed.add_history_entry("c");
+        assert_eq!(ed.history(), ["b", "c"]);
+        ed.set_max_history_len(1); // shrinking trims immediately
+        assert_eq!(ed.history(), ["c"]);
+    }
+
+    #[test]
+    fn append_history_writes_only_new_entries() {
+        let path =
+            std::env::temp_dir().join(format!("rusty_lines_hist_test_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut ed = Editor::new();
+        ed.add_history_entry("one");
+        ed.save_history(&path).unwrap();
+        ed.add_history_entry("two");
+        ed.append_history(&path).unwrap();
+        ed.append_history(&path).unwrap(); // nothing new: no-op
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+
+        // A second session appends without clobbering the first's entries.
+        let mut ed2 = Editor::new();
+        ed2.load_history(&path).unwrap();
+        ed2.add_history_entry("three");
+        ed2.append_history(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alt_f_accepts_one_hint_word() {
+        struct H;
+        impl Hooks for H {
+            fn hint(&self, line: &str, _history: &[String]) -> Option<String> {
+                (line == "he").then(|| "llo world".to_string())
+            }
+        }
+        let mut ring = Vec::new();
+
+        // At end of line: accept exactly one word of the hint.
+        let mut st = state_hooked("he", 2, &H);
+        handle_insert(&mut st, Key::Alt('f'), &[], &mut ring);
+        assert_eq!(st.buffer, "hello");
+        assert_eq!(st.cursor, 5);
+
+        // Mid-line: plain word motion, no hint involvement.
+        let mut st = state_hooked("he", 0, &H);
+        handle_insert(&mut st, Key::Alt('f'), &[], &mut ring);
+        assert_eq!(st.buffer, "he");
+        assert_eq!(st.cursor, 2);
     }
 }

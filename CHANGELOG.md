@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- History cap: `Editor::set_max_history_len` (readline `stifle_history`,
+  bash `HISTSIZE`); oldest entries drop past the limit.
+- Append-only history persistence: `Editor::append_history` writes only
+  entries added since the last load/save/append (bash `histappend`), so
+  concurrent sessions interleave instead of overwriting. `save_history`
+  now takes `&mut self` to track what's persisted.
+- Partial hint acceptance: M-f / Ctrl-Right at end of line accepts one
+  word of the history hint (fish's forward-word on an autosuggestion).
+- Documented existing C-l clear-screen in the feature matrix; recorded
+  positions on eager resize repaint and grapheme-cluster width math as
+  deliberate narrowings.
 - `docs/survey.md`: the per-editor line-editor field survey behind the
   README's feature matrix (reconstructed).
 - End-to-end pty test suite (`tests/pty.rs`): drives `examples/demo` under

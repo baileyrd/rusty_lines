@@ -58,9 +58,12 @@ full per-editor survey behind this table is in
 | Quoted insert: C-v / C-q; control chars render `^X`-style | readline |
 | Edit line in `$VISUAL`/`$EDITOR`: C-x C-e (emacs), `v` (vi normal); result returned as the line | readline, ZLE, fish (Alt-e) |
 | History: Up/Down with draft preservation, C-p/C-n, M-< / M-> | readline |
+| History cap: `set_max_history_len` drops oldest past the limit | readline `stifle_history`, bash `HISTSIZE` |
+| History persistence: `save_history` rewrites, `append_history` appends only new entries; `load_history` tolerates a rustyline `#V2` header | bash `histappend`; rustyline migration |
+| Clear screen: C-l clears and repaints the edit region at the top | readline `clear-screen` |
 | Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search | readline, ZLE |
 | Prefix history search: PageUp/PageDown, M-p/M-n | ZLE `history-beginning-search`, fish Up, PSReadLine |
-| History hints (autosuggestions) via `Hooks::hint`, Right/End accepts | fish, PSReadLine |
+| History hints (autosuggestions) via `Hooks::hint`, Right/End accepts; M-f / Ctrl-Right at end of line accepts one word | fish, PSReadLine |
 | Syntax highlighting while typing via `Hooks::highlight` | fish, ZLE plugins, replxx |
 | Tab completion via `Hooks::complete`: LCP insertion + columned candidate list | readline `CompletionType::List` |
 | Abbreviation expansion on space via `Hooks::expand_abbreviation` | fish `abbr` |
@@ -88,6 +91,14 @@ either niche, terminal-hostile, or a different program's job:
   insert mode; the unnamed register is the kill ring).
 - **Completion paging/menu-select** (fish's pager, ZLE menu-select):
   long candidate lists print unpaged.
+- **Eager SIGWINCH repaint** (readline repaints the moment the window
+  resizes). The width is re-read from the tty on every repaint, so the
+  next keystroke self-heals; installing a signal handler from a library
+  is the host's business, not the editor's.
+- **Grapheme-cluster cursor math** (combining marks, emoji ZWJ
+  sequences). Width is per-`char` via `unicode-width`; getting clusters
+  right would add a segmentation dependency while terminals themselves
+  disagree on cluster widths, so the common-case behavior is kept.
 - **Non-tty / non-Unix**: piped stdin gets a plain line read; non-Unix
   builds get a buffered prompt-and-read.
 
