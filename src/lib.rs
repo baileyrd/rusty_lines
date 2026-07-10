@@ -148,6 +148,9 @@ pub struct Editor {
     /// How many history entries are already in the history file, so
     /// `append_history` writes only the ones added since.
     persisted: usize,
+    /// When set, a new entry erases earlier duplicates everywhere in the
+    /// history, not just a consecutive repeat.
+    dedup: bool,
 }
 
 /// The piped-stdin path: one line, no prompt, no editing.
@@ -188,7 +191,15 @@ impl Editor {
             kill_ring: Vec::new(),
             max_history: usize::MAX,
             persisted: 0,
+            dedup: false,
         }
+    }
+
+    /// When enabled, adding an entry removes earlier duplicates anywhere
+    /// in the history (bash `HISTCONTROL=erasedups`; fish's behavior),
+    /// not just a consecutive repeat. Off by default.
+    pub fn set_history_dedup(&mut self, on: bool) {
+        self.dedup = on;
     }
 
     /// Cap the history at `n` entries (readline's `stifle_history`,
@@ -222,6 +233,22 @@ impl Editor {
         } else {
             line.to_string()
         };
+        if self.dedup {
+            let mut i = 0;
+            while i < self.history.len() {
+                if self.history[i] == entry {
+                    self.history.remove(i);
+                    // A removed entry below the persisted watermark shifts
+                    // it down; the file keeps the stale copy until the next
+                    // full save_history.
+                    if i < self.persisted {
+                        self.persisted -= 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
         if self.history.last() != Some(&entry) {
             self.history.push(entry);
             self.trim_history();
@@ -645,7 +672,23 @@ struct LineState<'a> {
     yank: Option<(usize, usize, usize)>,
     /// Last M-. insertion: (history index, span start, span end).
     lastarg: Option<(usize, usize, usize)>,
+    /// Completion menu cycling state, armed by the candidate list and
+    /// cleared by any non-Tab key.
+    menu: Option<MenuState>,
     hooks: &'a dyn Hooks,
+}
+
+/// Repeated-Tab candidate cycling (zsh `AUTO_MENU`): the word span being
+/// replaced and the candidate list captured when it was printed.
+#[cfg(unix)]
+struct MenuState {
+    /// Byte offset the completed word starts at.
+    start: usize,
+    /// Length of the replacement currently in the buffer.
+    inserted: usize,
+    /// Candidate currently inserted; `None` until the first cycle.
+    index: Option<usize>,
+    candidates: Vec<Candidate>,
 }
 
 #[cfg(unix)]
@@ -692,11 +735,26 @@ fn read_line_raw(
         this_action: Action::Other,
         yank: None,
         lastarg: None,
+        menu: None,
         hooks,
     };
     render(&mut st, history)?;
 
+    let mut cols = term_cols();
     loop {
+        // Idle wait: repaint if the terminal was resized while sitting at
+        // the prompt (no SIGWINCH handler — the 200ms poll tick notices).
+        // The tick also gives the host a beat to fire pending signal traps
+        // even when no input arrives to interrupt.
+        while !input_ready(200) {
+            hooks.on_interrupted_read();
+            let now = term_cols();
+            if now != cols {
+                cols = now;
+                render(&mut st, history)?;
+            }
+        }
+
         let Some(key) = read_key(hooks)? else {
             // EOF on stdin itself.
             finish_line(&mut st)?;
@@ -719,6 +777,11 @@ fn read_line_raw(
 
         let snapshot = (st.buffer.clone(), st.cursor);
         st.this_action = Action::Other;
+
+        // Any key but Tab ends candidate cycling.
+        if !matches!(key, Key::Tab) {
+            st.menu = None;
+        }
 
         match key {
             Key::Enter => {
@@ -781,7 +844,11 @@ fn read_line_raw(
                 }
             }
             Key::Tab => {
-                complete_at_cursor(&mut st)?;
+                if st.menu.is_some() {
+                    menu_next(&mut st);
+                } else {
+                    complete_at_cursor(&mut st)?;
+                }
             }
             Key::Paste(s) => {
                 // Insert the paste verbatim (normalizing line endings) —
@@ -921,6 +988,15 @@ fn handle_insert(st: &mut LineState, key: Key, history: &[String], ring: &mut Ve
         Key::Alt('u') => case_word(st, CaseOp::Upper),
         Key::Alt('l') => case_word(st, CaseOp::Lower),
         Key::Alt('c') => case_word(st, CaseOp::Capital),
+        Key::Alt('r') => {
+            // readline revert-line: undo every edit to this line at once.
+            if let Some((buf, cur)) = st.undo.first().cloned() {
+                st.cursor = cur.min(buf.len());
+                st.buffer = buf;
+                st.undo.clear();
+            }
+            st.this_action = Action::Undo; // don't snapshot the revert
+        }
         Key::Alt('.') | Key::Alt('_') => insert_last_arg(st, history),
         Key::Alt('<') => history_first(st, history),
         Key::Alt('>') => history_last(st),
@@ -1841,7 +1917,8 @@ fn history_prefix_next(st: &mut LineState, history: &[String]) {
 
 /// Tab completion: insert the longest
 /// common prefix; when that makes no progress, print the columned
-/// candidate list below the line.
+/// candidate list below the line and arm menu cycling, so further Tabs
+/// walk the candidates in-line (zsh `AUTO_MENU`).
 #[cfg(unix)]
 fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
     let (start, candidates) = st.hooks.complete(&st.buffer, st.cursor);
@@ -1880,8 +1957,34 @@ fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
         }
         st.painted_rows = 1;
         st.painted_cursor_row = 0;
+        st.menu = Some(MenuState {
+            start,
+            inserted: st.cursor - start,
+            index: None,
+            candidates,
+        });
     }
     Ok(())
+}
+
+/// A further Tab with the menu armed: replace the word with the next
+/// candidate, wrapping around the list.
+#[cfg(unix)]
+fn menu_next(st: &mut LineState) {
+    let Some(mut menu) = st.menu.take() else {
+        return;
+    };
+    let i = match menu.index {
+        None => 0,
+        Some(i) => (i + 1) % menu.candidates.len(),
+    };
+    menu.index = Some(i);
+    let replacement = &menu.candidates[i].replacement;
+    st.buffer
+        .replace_range(menu.start..menu.start + menu.inserted, replacement);
+    st.cursor = menu.start + replacement.len();
+    menu.inserted = replacement.len();
+    st.menu = Some(menu);
 }
 
 fn longest_common_prefix(names: &[&str]) -> String {
@@ -2024,6 +2127,7 @@ mod tests {
             this_action: Action::Other,
             yank: None,
             lastarg: None,
+            menu: None,
             hooks,
         }
     }
@@ -2270,6 +2374,59 @@ mod tests {
         ed2.append_history(&path).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn history_dedup_erases_earlier_duplicates() {
+        let mut ed = Editor::new();
+        ed.set_history_dedup(true);
+        ed.add_history_entry("a");
+        ed.add_history_entry("b");
+        ed.add_history_entry("a");
+        assert_eq!(ed.history(), ["b", "a"]);
+        // Off by default: only consecutive repeats are skipped.
+        let mut ed = Editor::new();
+        ed.add_history_entry("a");
+        ed.add_history_entry("b");
+        ed.add_history_entry("a");
+        assert_eq!(ed.history(), ["a", "b", "a"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revert_line_undoes_everything_at_once() {
+        let mut st = state("hello", 5);
+        st.undo = vec![("hello".to_string(), 5), ("hellox".to_string(), 6)];
+        st.buffer = "helloxyz".to_string();
+        st.cursor = 8;
+        let mut ring = Vec::new();
+        handle_insert(&mut st, Key::Alt('r'), &[], &mut ring);
+        assert_eq!(st.buffer, "hello");
+        assert_eq!(st.cursor, 5);
+        assert!(st.undo.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn menu_cycling_walks_candidates_and_wraps() {
+        let cand = |s: &str| Candidate {
+            display: s.to_string(),
+            replacement: s.to_string(),
+        };
+        let mut st = state("say al", 6);
+        st.menu = Some(MenuState {
+            start: 4,
+            inserted: 2,
+            index: None,
+            candidates: vec![cand("alpha"), cand("alphabet")],
+        });
+        menu_next(&mut st);
+        assert_eq!(st.buffer, "say alpha");
+        assert_eq!(st.cursor, 9);
+        menu_next(&mut st);
+        assert_eq!(st.buffer, "say alphabet");
+        menu_next(&mut st); // wraps back around
+        assert_eq!(st.buffer, "say alpha");
     }
 
     #[cfg(unix)]

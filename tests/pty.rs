@@ -9,19 +9,19 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn demo_path() -> std::path::PathBuf {
-    // target/debug/deps/pty-<hash> -> target/debug/examples/demo
+fn example_path(name: &str) -> std::path::PathBuf {
+    // target/debug/deps/pty-<hash> -> target/debug/examples/<name>
     let mut p = std::env::current_exe().unwrap();
     p.pop();
     if p.ends_with("deps") {
         p.pop();
     }
     p.push("examples");
-    p.push("demo");
+    p.push(name);
     p
 }
 
-fn spawn_demo() -> (OwnedFd, Child) {
+fn spawn_example(name: &str) -> (OwnedFd, Child) {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
     let mut ws = libc::winsize {
@@ -44,7 +44,7 @@ fn spawn_demo() -> (OwnedFd, Child) {
     assert_eq!(rc, 0, "openpty failed");
     let master = unsafe { OwnedFd::from_raw_fd(master) };
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-    let child = Command::new(demo_path())
+    let child = Command::new(example_path(name))
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave))
@@ -79,11 +79,12 @@ fn drain(master: &OwnedFd, out: &mut Vec<u8>, timeout_ms: i32) -> bool {
 /// read_line has the terminal set up, so keystrokes sent after it can't
 /// be swallowed by the cooked-mode tty driver (on macOS the driver owns
 /// C-w/C-y itself — VWERASE/VDSUSP — which corrupted unsynchronized runs).
-fn wait_for_prompt(master: &OwnedFd, out: &mut Vec<u8>, deadline: Instant) {
+fn wait_for_prompt(master: &OwnedFd, out: &mut Vec<u8>, deadline: Instant, prompt: &str) {
     loop {
-        // The paint is `\r ESC[J demo> <buffer> \r ESC[<col>G`: with an
-        // empty buffer, the text ends "demo> " + \r after ANSI-stripping.
-        if strip_ansi(out).trim_end_matches('\r').ends_with("demo> ") {
+        // The paint is `\r ESC[J <prompt> <buffer> \r ESC[<col>G`: with an
+        // empty buffer, the text ends with the prompt + \r after
+        // ANSI-stripping.
+        if strip_ansi(out).trim_end_matches('\r').ends_with(prompt) {
             return;
         }
         assert!(
@@ -100,14 +101,18 @@ fn wait_for_prompt(master: &OwnedFd, out: &mut Vec<u8>, deadline: Instant) {
 /// line; append Ctrl-D to exit the demo, and collect everything the
 /// editor wrote until the child exits.
 fn run_session(chunks: &[&[u8]]) -> String {
-    let (master, mut child) = spawn_demo();
+    run_session_in("demo", "demo> ", chunks)
+}
+
+fn run_session_in(example: &str, prompt: &str, chunks: &[&[u8]]) -> String {
+    let (master, mut child) = spawn_example(example);
     let mut m = std::fs::File::from(master.try_clone().unwrap());
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut out = Vec::new();
     let mut at_line_start = true;
     for chunk in chunks {
         if at_line_start {
-            wait_for_prompt(&master, &mut out, deadline);
+            wait_for_prompt(&master, &mut out, deadline, prompt);
         }
         m.write_all(chunk).unwrap();
         m.flush().unwrap();
@@ -118,7 +123,7 @@ fn run_session(chunks: &[&[u8]]) -> String {
         // Enter and Ctrl-C both end the line and repaint a fresh prompt.
         at_line_start = matches!(chunk.last(), Some(b'\r' | b'\x03'));
     }
-    wait_for_prompt(&master, &mut out, deadline);
+    wait_for_prompt(&master, &mut out, deadline, prompt);
     m.write_all(b"\x04").unwrap(); // Ctrl-D on the empty line: exit
     m.flush().unwrap();
 
@@ -243,4 +248,83 @@ fn bracketed_paste_inserts_literally() {
     // A pasted tab must insert, not trigger completion.
     let out = run_session(&[b"\x1b[200~a\tb\x1b[201~", b"\r"]);
     assert!(out.contains(&echo("a\tb")), "paste not literal:\n{out}");
+}
+
+#[test]
+fn tab_menu_cycles_candidates() {
+    // "al" → Tab inserts the LCP "alpha"; Tab again lists and arms the
+    // menu; further Tabs cycle: alpha (candidate 0), then alphabet.
+    let out = run_session_in(
+        "hooked",
+        "hooked> ",
+        &[b"al", b"\t", b"\t", b"\t", b"\t", b"\r"],
+    );
+    assert!(
+        out.contains("alphanumeric"),
+        "candidate list missing:\n{out}"
+    );
+    assert!(out.contains(&echo("alphabet")), "menu cycle wrong:\n{out}");
+}
+
+#[test]
+fn right_arrow_accepts_full_hint() {
+    let out = run_session_in(
+        "hooked",
+        "hooked> ",
+        &[b"alpha beta\r", b"alp", b"\x1b[C", b"\r"],
+    );
+    let hits = out.matches(&echo("alpha beta")).count();
+    assert!(hits >= 2, "hint not accepted (typed + hinted):\n{out}");
+}
+
+#[test]
+fn alt_f_accepts_one_word_of_hint() {
+    let out = run_session_in(
+        "hooked",
+        "hooked> ",
+        &[b"alpha beta\r", b"al", b"\x1bf", b"\r"],
+    );
+    assert!(
+        out.contains(&echo("alpha")),
+        "partial hint accept wrong:\n{out}"
+    );
+}
+
+#[test]
+fn resize_while_idle_repaints_and_keeps_the_line() {
+    // Type half a line, shrink the terminal while the editor idles at
+    // the prompt (no keystroke pending), then finish the line: the idle
+    // poll tick must notice the new width and nothing may be lost.
+    let (master, mut child) = spawn_example("demo");
+    let mut m = std::fs::File::from(master.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    wait_for_prompt(&master, &mut out, deadline, "demo> ");
+    m.write_all(b"abc").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let ws = libc::winsize {
+        ws_row: 24,
+        ws_col: 40,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+    assert_eq!(rc, 0, "TIOCSWINSZ failed");
+    std::thread::sleep(Duration::from_millis(500)); // > one idle tick
+    m.write_all(b"def\r").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    wait_for_prompt(&master, &mut out, deadline, "demo> ");
+    m.write_all(b"\x04").unwrap();
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "demo did not exit");
+    }
+    child.wait().unwrap();
+    let out = strip_ansi(&out);
+    assert!(
+        out.contains(&echo("abcdef")),
+        "line lost across resize:\n{out}"
+    );
 }
