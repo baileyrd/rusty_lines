@@ -21,8 +21,11 @@
 
 pub use imp::*;
 
+#[cfg(all(unix, not(feature = "libc-backend"), not(feature = "rusty-libc")))]
+compile_error!("enable one terminal backend: the default `libc-backend`, or `rusty-libc`");
+
 // ---- libc backend (default) ----------------------------------------------
-#[cfg(not(feature = "rusty-libc"))]
+#[cfg(all(feature = "libc-backend", not(feature = "rusty-libc")))]
 mod imp {
     use std::io;
 
