@@ -13,11 +13,21 @@ categories = ["command-line-interface"]
 # Display-column widths for the render engine — Unicode tables only.
 unicode-width = "0.2"
 
+[features]
+# Back the Unix terminal surface (termios/poll/read/winsize) with the
+# hand-rolled raw-syscall crate instead of the `libc` crate. Off by default:
+# `libc` remains the stable, portable backend until this proves out on both
+# arches. Linux-only — see rusty_libc's DESIGN.md.
+rusty-libc = ["dep:rusty_libc"]
+
 # Raw terminal mode (termios), poll, and window size are Unix-only; the
 # raw libc bindings are the most stable surface for them. Non-Unix builds
 # fall back to a plain buffered read.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Optional zero-dependency raw-syscall backend (Linux only), selected by the
+# `rusty-libc` feature.
+rusty_libc = { git = "https://github.com/baileyrd/rusty_libc", branch = "main", optional = true }
 
 # The pty end-to-end tests (tests/pty.rs) drive examples/demo under a
 # pseudo-terminal.
