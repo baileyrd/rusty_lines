@@ -229,6 +229,16 @@ fn ctrl_c_interrupts_the_line() {
 }
 
 #[test]
+fn ctrl_l_clears_screen_and_keeps_the_line() {
+    // C-l mid-line: the screen clears but the buffer and cursor survive.
+    let out = run_session(&[b"abc", b"\x0c", b"def", b"\r"]);
+    assert!(
+        out.contains(&echo("abcdef")),
+        "line lost across C-l:\n{out}"
+    );
+}
+
+#[test]
 fn bracketed_paste_inserts_literally() {
     // A pasted tab must insert, not trigger completion.
     let out = run_session(&[b"\x1b[200~a\tb\x1b[201~", b"\r"]);
