@@ -53,39 +53,78 @@ fn spawn_demo() -> (OwnedFd, Child) {
     (master, child)
 }
 
+/// Read whatever the pty has within `timeout_ms`, appending to `out`.
+/// Returns false on EOF/EIO (slave side fully closed).
+fn drain(master: &OwnedFd, out: &mut Vec<u8>, timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: master.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if n <= 0 || pfd.revents & libc::POLLIN == 0 {
+        return true; // nothing available right now
+    }
+    let mut buf = [0u8; 4096];
+    let r = unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+    if r <= 0 {
+        return false;
+    }
+    out.extend_from_slice(&buf[..r as usize]);
+    true
+}
+
+/// Wait until the editor has painted a fresh, empty prompt. This is the
+/// raw-mode synchronization point: the prompt is only painted once
+/// read_line has the terminal set up, so keystrokes sent after it can't
+/// be swallowed by the cooked-mode tty driver (on macOS the driver owns
+/// C-w/C-y itself — VWERASE/VDSUSP — which corrupted unsynchronized runs).
+fn wait_for_prompt(master: &OwnedFd, out: &mut Vec<u8>, deadline: Instant) {
+    loop {
+        // The paint is `\r ESC[J demo> <buffer> \r ESC[<col>G`: with an
+        // empty buffer, the text ends "demo> " + \r after ANSI-stripping.
+        if strip_ansi(out).trim_end_matches('\r').ends_with("demo> ") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no empty prompt; output so far:\n{}",
+            strip_ansi(out)
+        );
+        drain(master, out, 100);
+    }
+}
+
 /// Feed each chunk to the pty (whole, so escape sequences are never
-/// split), append Ctrl-D to exit the demo, then collect everything the
+/// split), waiting for the prompt before each chunk that starts a new
+/// line; append Ctrl-D to exit the demo, and collect everything the
 /// editor wrote until the child exits.
 fn run_session(chunks: &[&[u8]]) -> String {
     let (master, mut child) = spawn_demo();
     let mut m = std::fs::File::from(master.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    let mut at_line_start = true;
     for chunk in chunks {
+        if at_line_start {
+            wait_for_prompt(&master, &mut out, deadline);
+        }
         m.write_all(chunk).unwrap();
         m.flush().unwrap();
         // Let the editor drain this chunk before the next one, so a
         // trailing ESC is never glued to the next chunk's bytes.
         std::thread::sleep(Duration::from_millis(100));
+        drain(&master, &mut out, 0);
+        // Enter and Ctrl-C both end the line and repaint a fresh prompt.
+        at_line_start = matches!(chunk.last(), Some(b'\r' | b'\x03'));
     }
+    wait_for_prompt(&master, &mut out, deadline);
     m.write_all(b"\x04").unwrap(); // Ctrl-D on the empty line: exit
     m.flush().unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut out = Vec::new();
     let mut exited = false;
     loop {
-        let mut pfd = libc::pollfd {
-            fd: master.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let n = unsafe { libc::poll(&mut pfd, 1, 200) };
-        if n > 0 && pfd.revents & libc::POLLIN != 0 {
-            let mut buf = [0u8; 4096];
-            let r = unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            if r > 0 {
-                out.extend_from_slice(&buf[..r as usize]);
-                continue;
-            }
+        if !drain(&master, &mut out, 200) {
             break; // EOF/EIO: slave side fully closed
         }
         if exited {
