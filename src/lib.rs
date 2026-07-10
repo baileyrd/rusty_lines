@@ -66,6 +66,11 @@
 
 use std::io::{self, Read, Write};
 
+// Terminal syscall backend: the `libc` crate by default, `rusty_libc` under
+// the `rusty-libc` feature.
+#[cfg(unix)]
+mod term_sys;
+
 /// One completion candidate: the text shown in the columned list, and the
 /// text inserted into the buffer.
 pub struct Candidate {
@@ -231,7 +236,7 @@ impl Editor {
             // A non-tty stdin (a script piped into an "interactive"
             // host) can't enter raw mode; fall back to a plain silent
             // read, like readline does.
-            if unsafe { libc::isatty(0) } == 0 {
+            if !term_sys::isatty_stdin() {
                 return read_line_plain();
             }
             read_line_raw(self, prompt, rprompt, hooks)
@@ -289,55 +294,39 @@ enum Key {
 /// terminal to an external `$EDITOR` (C-x C-e) and take it back.
 #[cfg(unix)]
 struct RawMode {
-    saved: libc::termios,
-    raw: libc::termios,
+    saved: term_sys::Termios,
+    raw: term_sys::Termios,
 }
 
 #[cfg(unix)]
 impl RawMode {
     fn enable() -> io::Result<RawMode> {
-        unsafe {
-            let mut t: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(0, &mut t) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let saved = t;
-            // Input: no Ctrl-S/Q flow control (freeing C-s for forward
-            // search), no CR→NL mangling. Local: no canonical buffering,
-            // no echo, no signal generation (^C becomes a key we handle),
-            // no ^V. Output stays cooked so ordinary `println!` keeps
-            // working for lists and job notices.
-            t.c_iflag &= !(libc::IXON | libc::ICRNL | libc::INLCR);
-            t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
-            t.c_cc[libc::VMIN] = 1;
-            t.c_cc[libc::VTIME] = 0;
-            if libc::tcsetattr(0, libc::TCSADRAIN, &t) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(RawMode { saved, raw: t })
-        }
+        let saved = term_sys::tcgetattr_stdin()?;
+        // Input: no Ctrl-S/Q flow control (freeing C-s for forward
+        // search), no CR→NL mangling. Local: no canonical buffering,
+        // no echo, no signal generation (^C becomes a key we handle),
+        // no ^V. Output stays cooked so ordinary `println!` keeps
+        // working for lists and job notices.
+        let mut raw = saved;
+        term_sys::apply_raw_flags(&mut raw);
+        term_sys::tcsetattr_stdin_drain(&raw)?;
+        Ok(RawMode { saved, raw })
     }
 
     /// Back to the shell's normal (cooked) state, for an external editor.
     fn suspend(&self) {
-        unsafe {
-            libc::tcsetattr(0, libc::TCSADRAIN, &self.saved);
-        }
+        let _ = term_sys::tcsetattr_stdin_drain(&self.saved);
     }
 
     fn resume(&self) {
-        unsafe {
-            libc::tcsetattr(0, libc::TCSADRAIN, &self.raw);
-        }
+        let _ = term_sys::tcsetattr_stdin_drain(&self.raw);
     }
 }
 
 #[cfg(unix)]
 impl Drop for RawMode {
     fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(0, libc::TCSADRAIN, &self.saved);
-        }
+        let _ = term_sys::tcsetattr_stdin_drain(&self.saved);
     }
 }
 
@@ -368,12 +357,7 @@ impl Drop for BracketedPaste {
 /// vs escape-sequence disambiguation.
 #[cfg(unix)]
 fn input_ready(ms: i32) -> bool {
-    let mut pfd = libc::pollfd {
-        fd: 0,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
+    term_sys::poll_stdin(ms)
 }
 
 /// One byte straight off fd 0 — deliberately *not* through
@@ -382,23 +366,17 @@ fn input_ready(ms: i32) -> bool {
 /// arrow keys literally didn't work through the buffered reader).
 #[cfg(unix)]
 fn read_byte(hooks: &dyn Hooks) -> io::Result<Option<u8>> {
-    let mut b = [0u8; 1];
     loop {
-        let n = unsafe { libc::read(0, b.as_mut_ptr().cast(), 1) };
-        match n {
-            0 => return Ok(None),
-            1 => return Ok(Some(b[0])),
-            _ => {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    // A signal (e.g. a deferred TERM) landed mid-read; let
-                    // trap machinery see it at the next safe point and
-                    // keep reading.
-                    hooks.on_interrupted_read();
-                    continue;
-                }
-                return Err(e);
+        match term_sys::read_stdin_byte() {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                // A signal (e.g. a deferred TERM) landed mid-read; let
+                // trap machinery see it at the next safe point and
+                // keep reading.
+                hooks.on_interrupted_read();
+                continue;
             }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -516,13 +494,7 @@ fn read_key(hooks: &dyn Hooks) -> io::Result<Option<Key>> {
 /// Terminal width in columns (fallback 80).
 #[cfg(unix)]
 fn term_cols() -> usize {
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-            return ws.ws_col as usize;
-        }
-    }
-    80
+    term_sys::term_cols_stdout().unwrap_or(80)
 }
 
 /// Display width of `s`, skipping ANSI SGR escape sequences — the prompt

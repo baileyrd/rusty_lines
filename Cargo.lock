@@ -9,10 +9,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "rusty_libc"
+version = "0.0.1"
+source = "git+https://github.com/baileyrd/rusty_libc?branch=main#45e0ba48e09a054f6b965d30f39aad40c224804e"
+
+[[package]]
 name = "rusty_lines"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rusty_libc",
  "unicode-width",
 ]
 
