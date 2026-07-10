@@ -33,16 +33,17 @@ jobs:
       - run: cargo check --all-targets
       - run: cargo test
 
-  rusty-libc:
-    # The optional raw-syscall backend (Linux-only) — otherwise nothing
-    # exercises the feature.
-    name: Feature (rusty-libc)
+  libc-backend:
+    # rusty_libc is the default backend on Linux, so the plain test job
+    # already covers it; this exercises the libc escape hatch, which
+    # otherwise only builds on macOS.
+    name: Feature (libc-backend)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable && rustup component add clippy
-      - run: cargo test --features rusty-libc
-      - run: cargo clippy --all-targets --features rusty-libc -- -D warnings
+      - run: cargo test --no-default-features --features libc-backend
+      - run: cargo clippy --all-targets --no-default-features --features libc-backend -- -D warnings
 
   lint:
     name: Clippy + rustfmt

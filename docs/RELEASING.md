@@ -17,15 +17,15 @@ other change.
 ## 1. Pre-flight
 
 - [ ] `main` is green in CI — all six jobs (Linux/macOS tests, Windows
-      check, `Feature (rusty-libc)`, clippy+rustfmt+doc, MSRV).
+      check, `Feature (libc-backend)`, clippy+rustfmt+doc, MSRV).
 - [ ] Local checkout is synced to `main` with a clean tree.
 - [ ] Full local sweep passes:
 
   ```sh
   cargo test
-  cargo test --features rusty-libc
+  cargo test --no-default-features --features libc-backend
   cargo clippy --all-targets -- -D warnings
-  cargo clippy --all-targets --features rusty-libc -- -D warnings
+  cargo clippy --all-targets --no-default-features --features libc-backend -- -D warnings
   cargo fmt --check
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
   cargo check --all-targets --target x86_64-pc-windows-gnu
