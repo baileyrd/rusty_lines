@@ -3,7 +3,7 @@
 ## Unreleased
 
 - CI (build/test on Linux, macOS, Windows; clippy, rustfmt, docs, MSRV),
-  dependabot, `rust-version = "1.87"`, API docs for all public items with
+  dependabot, `rust-version = "1.88"`, API docs for all public items with
   `#![warn(missing_docs)]`, and a compiled crate-level usage example.
 
 ## 0.1.0
