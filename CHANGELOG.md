@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- End-to-end pty test suite (`tests/pty.rs`): drives `examples/demo` under
+  a pseudo-terminal — typing/echo, emacs editing, kill/yank, history
+  recall, Ctrl-C, and bracketed paste.
 - CI (build/test on Linux, macOS, Windows; clippy, rustfmt, docs, MSRV),
   dependabot, `rust-version = "1.88"`, API docs for all public items with
   `#![warn(missing_docs)]`, and a compiled crate-level usage example.
