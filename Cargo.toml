@@ -14,22 +14,27 @@ categories = ["command-line-interface"]
 unicode-width = "0.2"
 
 [features]
-# Default: back the Unix terminal surface (termios/poll/read/winsize) with the
-# `libc` crate — the stable, portable backend.
-default = ["libc-backend"]
-libc-backend = ["dep:libc"]
-# Back it with the hand-rolled raw-syscall crate instead (Linux only, zero
-# third-party deps). With `--no-default-features --features rusty-libc`, libc is
-# not linked at all. When both are enabled, rusty-libc wins.
+# The terminal surface (termios/poll/read/winsize) is backed by the hand-rolled
+# raw-syscall crate by default. That is Linux-only, so the backend is actually
+# chosen by target: `rusty_libc` on Linux, the `libc` crate on other Unix (see
+# the cfgs in `term_sys.rs`). `libc-backend` is an escape hatch to force the
+# libc backend on Linux too (`--no-default-features --features libc-backend`).
+default = ["rusty-libc"]
 rusty-libc = ["dep:rusty_libc"]
+libc-backend = ["dep:libc"]
 
 # Raw terminal mode (termios), poll, and window size are Unix-only. Non-Unix
 # builds fall back to a plain buffered read and need neither backend.
-[target.'cfg(unix)'.dependencies]
-# Default backend — optional so a rusty-libc-only build links no libc.
-libc = { version = "0.2", optional = true }
-# Optional zero-dependency raw-syscall backend (Linux only).
+
+# Linux: `rusty_libc` is the default backend; `libc` only when forced.
+[target.'cfg(target_os = "linux")'.dependencies]
 rusty_libc = { git = "https://github.com/baileyrd/rusty_libc", branch = "main", optional = true }
+libc = { version = "0.2", optional = true }
+
+# Other Unix (macOS/BSD): the libc backend is the only option — `rusty_libc` is
+# Linux-only — so libc is a plain dependency there.
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+libc = "0.2"
 
 # The pty end-to-end tests (tests/pty.rs) drive examples/demo under a
 # pseudo-terminal.
