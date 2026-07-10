@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,6 +32,17 @@ jobs:
       - run: rustup update stable && rustup default stable
       - run: cargo check --all-targets
       - run: cargo test
+
+  rusty-libc:
+    # The optional raw-syscall backend (Linux-only) — otherwise nothing
+    # exercises the feature.
+    name: Feature (rusty-libc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable && rustup default stable && rustup component add clippy
+      - run: cargo test --features rusty-libc
+      - run: cargo clippy --all-targets --features rusty-libc -- -D warnings
 
   lint:
     name: Clippy + rustfmt
