@@ -16,7 +16,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable
       - run: cargo build --all-targets
       - run: cargo test
@@ -27,7 +27,7 @@ jobs:
     name: Check (windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable
       - run: cargo check --all-targets
       - run: cargo test
@@ -36,7 +36,7 @@ jobs:
     name: Clippy + rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable && rustup component add clippy rustfmt
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --check
@@ -48,6 +48,6 @@ jobs:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.88 --profile minimal && rustup default 1.88
       - run: cargo check --all-targets
