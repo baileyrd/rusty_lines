@@ -24,19 +24,21 @@ fn demo_path() -> std::path::PathBuf {
 fn spawn_demo() -> (OwnedFd, Child) {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
-    let ws = libc::winsize {
+    let mut ws = libc::winsize {
         ws_row: 24,
         ws_col: 80,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
     let rc = unsafe {
+        // *mut pointers throughout: macOS's binding takes *mut termios /
+        // *mut winsize where Linux takes *const, and *mut coerces to both.
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &ws,
+            std::ptr::null_mut(),
+            &raw mut ws,
         )
     };
     assert_eq!(rc, 0, "openpty failed");
