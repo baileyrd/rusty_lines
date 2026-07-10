@@ -1,5 +1,7 @@
 # rusty_lines
 
+[![CI](https://github.com/baileyrd/rusty_lines/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/rusty_lines/actions/workflows/ci.yml)
+
 A hand-rolled line editor for Rust — a readline alternative with no
 dependency on readline, ncurses, or any editing crate (just `libc` for
 termios and `unicode-width` for display columns). Grown inside the

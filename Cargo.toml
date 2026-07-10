@@ -2,6 +2,7 @@
 name = "rusty_lines"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "A hand-rolled readline alternative: emacs + vi keymaps, kill ring, undo, incremental/prefix history search, bracketed paste, completion/hint/highlight hooks, and a right-side prompt."
 repository = "https://github.com/baileyrd/rusty_lines"
