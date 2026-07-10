@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `docs/RELEASING.md`: release checklist (crates.io blockers, MSRV sync
+  points, tag/publish steps).
 - History cap: `Editor::set_max_history_len` (readline `stifle_history`,
   bash `HISTSIZE`); oldest entries drop past the limit.
 - Append-only history persistence: `Editor::append_history` writes only
