@@ -31,6 +31,7 @@ pub trait Hooks {
     fn vi_mode(&self) -> bool;              // checked live, per read_line
     fn external_editor(&self) -> Option<String>; // C-x C-e; falls back $VISUAL/$EDITOR/vi
     fn on_interrupted_read(&self);          // EINTR: fire pending signal traps
+    fn host_binding(&self, tag: &str, line: &mut String, cursor: &mut usize); // bind -x
 }
 ```
 
@@ -74,6 +75,13 @@ full per-editor survey behind this table is in
 | vi mode (`Hooks::vi_mode`): counts; `d`/`c`/`y` operators over motions; `h l 0 ^ $ w W b B e E f F t T ; ,`; `x X D C s S Y r ~ p P u`; `i I a A`; `k`/`j` history; `cw`≡`ce` quirk; Esc backs the cursor up one | readline vi mode, ksh, ZLE |
 | Wide chars + UTF-8 input assembly; ANSI-aware width math; soft-wrap repaint; `^X` control-char visualization keeps cursor math exact | all modern |
 | Resize: width re-read on every repaint; a resize while idle at the prompt repaints within a poll tick (~200ms) | readline SIGWINCH, approximated without signals |
+| Key rebinding: `bind`/`unbind` accept readline key-spec spellings (`\C-x`, `\M-f`, `\e[1;5C`), remapping single keys to named `EditorAction`s; `bindings()` lists the effective keymap | readline `bind '"\C-x": kill-line'`, `bind -P`, `bind -r` |
+| Host-command bindings: `bind_host` + `Hooks::host_binding` — raw mode suspends, the host runs its command against the line/cursor, the edit resumes | bash `bind -x` (`READLINE_LINE`/`READLINE_POINT`) |
+| Readline variables: `set_completion_ignore_case`, `set_show_all_if_ambiguous`, `set_menu_complete`, `set_bell_style` | readline `set completion-ignore-case on` … |
+| Read deadline: `read_line_timeout` returns `ReadResult::TimedOut` when no complete line arrives in time | bash `$TMOUT`, readline `rl_set_timeout` |
+| History timestamps: `#<epoch>` comment lines, written only under `set_history_timestamps`, always parsed on load (both formats round-trip); `history_timestamps()` exposes them | bash `HISTTIMEFORMAT` file format |
+| In-place history replacement: `replace_history` resyncs the list after a host's history edits without rebuilding the editor (kill ring and session state survive) | bash `history -c` / `history -d` support |
+| Terminal facilities: `terminal_size()` (cols, rows) and `with_echo_disabled` (panic-safe echo-off around a closure) | bash `checkwinsize` `$COLUMNS`/`$LINES`; `read -s` |
 
 ## Deliberate narrowings
 
@@ -85,8 +93,12 @@ either niche, terminal-hostile, or a different program's job:
   embedded newlines (from a paste or C-v C-j) render as `⏎` and return
   correctly, but Up/Down navigate history, not buffer rows. C-x C-e hands
   real multi-line editing to `$EDITOR`.
-- **Programmable keybindings** (readline's `bind`/`.inputrc`, ZLE widgets,
-  fish's `bind`). The keymap is fixed.
+- **Full keymap programmability** (readline's `.inputrc`, ZLE widgets,
+  fish's `bind` functions). Single-key rebinding of the named actions and
+  host-command bindings *are* supported (see the matrix — revisiting a
+  narrowing); what stays declined: user-defined widgets, multi-key chord
+  bindings beyond the built-in C-x set, rebinding vi normal mode, and
+  `.inputrc` file parsing (the host's `bind` builtin passes specs through).
 - **Keyboard macros** (readline C-x `(` … `)`), **numeric arguments in
   emacs mode** (M-digit; vi counts are supported), **mark/region**
   (C-@, C-x C-x), **redo** (readline has none either).

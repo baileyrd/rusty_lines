@@ -36,11 +36,18 @@ psql, and hundreds of others link it.
   columned candidate list); C-l clear-screen; the history cap
   (`stifle_history` / bash `HISTSIZE`), bash's `histappend`
   append-only persistence and `HISTCONTROL=erasedups` dedup (opt-in),
-  and `revert-line` (M-r).
-- **Declined:** `.inputrc` programmable keybindings; keyboard macros
-  (C-x `(` … C-x `)`); emacs-mode numeric arguments (M-digit, C-u);
-  mark/region (C-@, C-x C-x). (`menu-complete` was initially declined,
-  then adopted as repeated-Tab cycling — see the matrix.)
+  and `revert-line` (M-r); single-key rebinding (`bind '"\C-x": function'`,
+  `bind -P`, `bind -r`) over a named-action enum, bash's `bind -x`
+  host-command contract (`READLINE_LINE`/`READLINE_POINT`), the
+  `completion-ignore-case` / `show-all-if-ambiguous` / `menu-complete` /
+  `bell-style` variables, and the read timeout (`rl_set_timeout`,
+  bash `$TMOUT`).
+- **Declined:** `.inputrc` *file parsing* (the host's `bind` builtin
+  passes readline key specs through instead); multi-key chord bindings
+  beyond the built-in C-x set; keyboard macros (C-x `(` … C-x `)`);
+  emacs-mode numeric arguments (M-digit, C-u); mark/region (C-@,
+  C-x C-x). (`menu-complete` and single-key rebinding were initially
+  declined, then adopted — see the matrix.)
 
 ### libedit (editline)
 
@@ -188,6 +195,13 @@ the README; kept in both places deliberately.)
 | vi mode (`Hooks::vi_mode`): counts; `d`/`c`/`y` operators over motions; `h l 0 ^ $ w W b B e E f F t T ; ,`; `x X D C s S Y r ~ p P u`; `i I a A`; `k`/`j` history; `cw`≡`ce` quirk; Esc backs the cursor up one | readline vi mode, ksh, ZLE |
 | Wide chars + UTF-8 input assembly; ANSI-aware width math; soft-wrap repaint; `^X` control-char visualization keeps cursor math exact | all modern |
 | Resize: width re-read on every repaint; a resize while idle at the prompt repaints within a poll tick (~200ms) | readline SIGWINCH, approximated without signals |
+| Key rebinding: `bind`/`unbind` accept readline key-spec spellings (`\C-x`, `\M-f`, `\e[1;5C`), remapping single keys to named `EditorAction`s; `bindings()` lists the effective keymap | readline `bind '"\C-x": kill-line'`, `bind -P`, `bind -r` |
+| Host-command bindings: `bind_host` + `Hooks::host_binding` — raw mode suspends, the host runs its command against the line/cursor, the edit resumes | bash `bind -x` (`READLINE_LINE`/`READLINE_POINT`) |
+| Readline variables: `set_completion_ignore_case`, `set_show_all_if_ambiguous`, `set_menu_complete`, `set_bell_style` | readline `set completion-ignore-case on` … |
+| Read deadline: `read_line_timeout` returns `ReadResult::TimedOut` when no complete line arrives in time | bash `$TMOUT`, readline `rl_set_timeout` |
+| History timestamps: `#<epoch>` comment lines, written only under `set_history_timestamps`, always parsed on load (both formats round-trip); `history_timestamps()` exposes them | bash `HISTTIMEFORMAT` file format |
+| In-place history replacement: `replace_history` resyncs the list after a host's history edits without rebuilding the editor (kill ring and session state survive) | bash `history -c` / `history -d` support |
+| Terminal facilities: `terminal_size()` (cols, rows) and `with_echo_disabled` (panic-safe echo-off around a closure) | bash `checkwinsize` `$COLUMNS`/`$LINES`; `read -s` |
 
 ## Deliberate narrowings
 
@@ -199,9 +213,15 @@ either niche, terminal-hostile, or a different program's job:
   one logical line; embedded newlines (from a paste or C-v C-j) render
   as `⏎` and return correctly, but Up/Down navigate history, not buffer
   rows. C-x C-e hands real multi-line editing to `$EDITOR`.
-- **Programmable keybindings** (readline's `bind`/`.inputrc`, ZLE
-  widgets, fish's `bind`, reedline's keybinding config). The keymap is
-  fixed; hosts customize through `Hooks`, not key tables.
+- **Full keymap programmability** (readline's `.inputrc`, ZLE widgets,
+  fish's `bind` functions, reedline's keybinding config). Single-key
+  rebinding of the named actions and host-command bindings *are*
+  supported (see the matrix — revisiting a narrowing); what stays
+  declined: user-defined widgets (actions are the built-in enum, not
+  host code — except `bind_host`, which is exactly bash's `bind -x`
+  scope), multi-key chord bindings beyond the built-in C-x set,
+  rebinding vi normal mode, and `.inputrc` file parsing (the host's
+  `bind` builtin passes readline key specs through verbatim).
 - **Keyboard macros** (readline C-x `(` … `)`), **numeric arguments in
   emacs mode** (M-digit; vi counts *are* supported), **mark/region**
   (C-@, C-x C-x), **redo** (ZLE, fish, and PSReadLine have it; readline

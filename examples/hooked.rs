@@ -4,10 +4,11 @@
 //!     cargo run --example hooked
 //!
 //! Tab completes from a fixed word list; typing shows a dimmed hint from
-//! history (Right/End accepts it, M-f accepts one word). Ctrl-D on an
-//! empty line exits.
+//! history (Right/End accepts it, M-f accepts one word); C-o is rebound
+//! to unix-line-discard and C-g runs a host binding that uppercases the
+//! line (bash `bind -x` style). Ctrl-D on an empty line exits.
 
-use rusty_lines::{Candidate, Editor, Hooks, ReadResult};
+use rusty_lines::{Candidate, Editor, EditorAction, Hooks, ReadResult};
 
 const WORDS: &[&str] = &["alpha", "alphabet", "alphanumeric", "beta", "gamma"];
 
@@ -41,10 +42,19 @@ impl Hooks for DemoHooks {
             .find(|h| h.starts_with(line) && h.len() > line.len())
             .map(|h| h[line.len()..].to_string())
     }
+
+    fn host_binding(&self, tag: &str, line: &mut String, cursor: &mut usize) {
+        if tag == "upcase" {
+            *line = line.to_uppercase();
+            *cursor = line.len();
+        }
+    }
 }
 
 fn main() -> std::io::Result<()> {
     let mut ed = Editor::new();
+    ed.bind("\\C-o", EditorAction::UnixLineDiscard)?;
+    ed.bind_host("\\C-g", "upcase".to_string())?;
     loop {
         match ed.read_line("hooked> ", "", &DemoHooks)? {
             ReadResult::Line(line) => {
@@ -54,7 +64,7 @@ fn main() -> std::io::Result<()> {
                 println!("{line}");
             }
             ReadResult::Interrupted => println!("^C"),
-            ReadResult::Eof => break,
+            ReadResult::Eof | ReadResult::TimedOut => break,
         }
     }
     Ok(())
