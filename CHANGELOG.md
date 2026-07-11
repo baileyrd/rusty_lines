@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.0 — 2026-07-11
+
+- The terminal syscall surface (termios/poll/read/winsize) moved into
+  `src/term_sys.rs` with two backends: the hand-rolled `rusty_libc`
+  raw-syscall crate — now the default on Linux, linking no third-party
+  libc bindings — and the `libc` crate (other Unix; on Linux via
+  `--no-default-features --features libc-backend`). CI exercises both.
 - Releases are git-based (tag + GitHub release), not published to
   crates.io: `publish = false` in Cargo.toml, and `docs/RELEASING.md`
   reworked accordingly (the crates.io section replaced by a downstream

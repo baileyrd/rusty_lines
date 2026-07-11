@@ -64,7 +64,7 @@ full per-editor survey behind this table is in
 | Clear screen: C-l clears and repaints the edit region at the top | readline `clear-screen` |
 | Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search | readline, ZLE |
 | Prefix history search: PageUp/PageDown, M-p/M-n | ZLE `history-beginning-search`, fish Up, PSReadLine |
-| History hints (autosuggestions) via `Hooks::hint`, Right/End accepts; M-f / Ctrl-Right at end of line accepts one word | fish, PSReadLine |
+| History hints (autosuggestions) via `Hooks::hint`, Right/End accepts; M-f / Ctrl-Right at end of line accepts one word | fish, PSReadLine, linenoise hints |
 | Syntax highlighting while typing via `Hooks::highlight` | fish, ZLE plugins, replxx |
 | Tab completion via `Hooks::complete`: LCP insertion + columned candidate list | readline `CompletionType::List` |
 | Menu cycling: Tab after the candidate list walks the candidates in-line, wrapping around | zsh `AUTO_MENU`, readline `menu-complete` |
