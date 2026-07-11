@@ -8,8 +8,8 @@
 //!
 //! The host integrates through the [`Hooks`] trait (completion, hints,
 //! syntax highlighting, abbreviations, a live vi-mode flag, external
-//! editor resolution, and an interrupted-read callback); [`NoHooks`]
-//! gives plain editing.
+//! editor resolution, an interrupted-read callback, and host-command
+//! key bindings); [`NoHooks`] gives plain editing.
 //!
 //! Layers, bottom to top:
 //!   * raw terminal mode (termios) behind an RAII guard, so every exit path
@@ -33,7 +33,9 @@
 //!     with counts, the `d`/`c`/`y` operators over motions, `f F t T ; ,`
 //!     character finds, and the standard normal-mode edits — selected
 //!     live per `read_line` via [`Hooks::vi_mode`], so switching needs
-//!     no editor rebuild at all;
+//!     no editor rebuild at all; single keys are rebindable to named
+//!     [`EditorAction`]s or host commands ([`Editor::bind`],
+//!     [`Editor::bind_host`] — readline's `bind`, bash's `bind -x`);
 //!   * history: in-memory with consecutive-dedup (multi-line entries
 //!     stored bash-style with `; ` joining), plain-file persistence,
 //!     Up/Down navigation with draft preservation, Ctrl-R/Ctrl-S
@@ -54,6 +56,7 @@
 //!     ReadResult::Line(line) => ed.add_history_entry(&line),
 //!     ReadResult::Interrupted => { /* Ctrl-C */ }
 //!     ReadResult::Eof => { /* Ctrl-D on an empty line */ }
+//!     ReadResult::TimedOut => { /* read_line_timeout deadline only */ }
 //! }
 //! # Ok(())
 //! # }
@@ -119,12 +122,161 @@ pub trait Hooks {
     /// Called when a signal interrupts the blocking read (`EINTR`) —
     /// a shell fires its pending traps here. The read then resumes.
     fn on_interrupted_read(&self) {}
+    /// Invoked for a key bound via [`Editor::bind_host`] — bash's
+    /// `bind -x` contract. The editor suspends raw mode, hands over the
+    /// current buffer and cursor (byte offset) for the host to run its
+    /// command with (`READLINE_LINE`/`READLINE_POINT`), writes back
+    /// whatever the host left in them, and repaints. A cursor written
+    /// past the end of the line (or inside a UTF-8 sequence) is clamped.
+    fn host_binding(&self, _tag: &str, _line: &mut String, _cursor: &mut usize) {}
 }
 
 /// A no-op `Hooks`: plain editing with no completion, hints,
 /// highlighting, or abbreviations.
 pub struct NoHooks;
 impl Hooks for NoHooks {}
+
+/// A named edit action — every command in the emacs (and vi-insert)
+/// keymap, using readline's command names camel-cased. What
+/// [`Editor::bind`] binds a key to and [`Editor::bindings`] reports
+/// (a shell's `bind '"\C-x": kill-line'` / `bind -P`).
+///
+/// The enum is `#[non_exhaustive]`: actions may be added, so downstream
+/// name→action tables should match by name with a fallthrough.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorAction {
+    /// Insert the typed character (with abbreviation expansion on space).
+    SelfInsert,
+    /// Finish the line and return it (`accept-line`, Enter).
+    AcceptLine,
+    /// Abandon the line ([`ReadResult::Interrupted`], C-c).
+    Interrupt,
+    /// Delete the character under the cursor; on an empty line, EOF
+    /// (`delete-char` with bash's C-d end-of-file behavior).
+    DeleteCharOrEof,
+    /// Delete the character under the cursor (`delete-char`, Delete).
+    DeleteChar,
+    /// Delete the character before the cursor (`backward-delete-char`).
+    BackwardDeleteChar,
+    /// Move to the start of the line (`beginning-of-line`, C-a/Home).
+    BeginningOfLine,
+    /// Move to the end of the line; at end, accept the hint
+    /// (`end-of-line`, C-e/End).
+    EndOfLine,
+    /// Move forward one character; at end, accept the hint
+    /// (`forward-char`, C-f/Right).
+    ForwardChar,
+    /// Move back one character (`backward-char`, C-b/Left).
+    BackwardChar,
+    /// Move forward one alphanumeric word; at end, accept one hint word
+    /// (`forward-word`, M-f/Ctrl-Right).
+    ForwardWord,
+    /// Move back one alphanumeric word (`backward-word`, M-b/Ctrl-Left).
+    BackwardWord,
+    /// Kill to the end of the line (`kill-line`, C-k).
+    KillLine,
+    /// Kill to the start of the line (`unix-line-discard`, C-u).
+    UnixLineDiscard,
+    /// Kill the whitespace-delimited word before the cursor
+    /// (`unix-word-rubout`, C-w).
+    UnixWordRubout,
+    /// Kill the alphanumeric word after the cursor (`kill-word`, M-d).
+    KillWord,
+    /// Kill the alphanumeric word before the cursor
+    /// (`backward-kill-word`, M-Backspace).
+    BackwardKillWord,
+    /// Insert the top of the kill ring (`yank`, C-y).
+    Yank,
+    /// Rotate the last yank to the previous ring entry (`yank-pop`, M-y).
+    YankPop,
+    /// Transpose the characters around the cursor (`transpose-chars`, C-t).
+    TransposeChars,
+    /// Transpose the words around the cursor (`transpose-words`, M-t).
+    TransposeWords,
+    /// Uppercase to the end of the word (`upcase-word`, M-u).
+    UpcaseWord,
+    /// Lowercase to the end of the word (`downcase-word`, M-l).
+    DowncaseWord,
+    /// Capitalize the word (`capitalize-word`, M-c).
+    CapitalizeWord,
+    /// Undo the last edit (`undo`, C-_/C-z).
+    Undo,
+    /// Undo every edit to this line at once (`revert-line`, M-r).
+    RevertLine,
+    /// Insert the last word of the previous history entry; repeats cycle
+    /// older entries (`insert-last-argument`, M-./M-_).
+    InsertLastArgument,
+    /// Recall the previous history entry (`previous-history`, Up/C-p).
+    PreviousHistory,
+    /// Recall the next history entry, or the stashed draft
+    /// (`next-history`, Down/C-n).
+    NextHistory,
+    /// Jump to the oldest history entry (`beginning-of-history`, M-<).
+    BeginningOfHistory,
+    /// Back to the live draft line (`end-of-history`, M->).
+    EndOfHistory,
+    /// Previous history entry with the prefix before the cursor
+    /// (`history-search-backward`, PageUp/M-p).
+    HistorySearchBackward,
+    /// Next prefix match, or back to the draft
+    /// (`history-search-forward`, PageDown/M-n).
+    HistorySearchForward,
+    /// Enter incremental search, older matches
+    /// (`reverse-search-history`, C-r).
+    ReverseSearchHistory,
+    /// Enter incremental search, newer matches
+    /// (`forward-search-history`, C-s).
+    ForwardSearchHistory,
+    /// Clear the screen and repaint the line at the top
+    /// (`clear-screen`, C-l).
+    ClearScreen,
+    /// Complete the word at the cursor: LCP insertion, candidate list,
+    /// then menu cycling (`complete`, Tab). Behaves as [`MenuComplete`]
+    /// under [`Editor::set_menu_complete`].
+    ///
+    /// [`MenuComplete`]: EditorAction::MenuComplete
+    Complete,
+    /// Insert the first completion candidate immediately; repeats cycle
+    /// through the rest (`menu-complete`).
+    MenuComplete,
+    /// Insert the next key literally (`quoted-insert`, C-v/C-q).
+    QuotedInsert,
+    /// Edit the line in `$VISUAL`/`$EDITOR` and execute the result
+    /// (`edit-and-execute-command`, C-x C-e).
+    EditAndExecuteCommand,
+}
+
+/// What ringing the terminal bell does — readline's `bell-style`
+/// variable, set via [`Editor::set_bell_style`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BellStyle {
+    /// No feedback.
+    None,
+    /// BEL — the terminal's audible beep (readline's default).
+    #[default]
+    Audible,
+    /// A screen flash (reverse-video flip) instead of a beep.
+    Visible,
+}
+
+/// A key's resolved binding: a named action, a host command tag
+/// (`bind -x`), or explicitly nothing (`bind -r` masking a default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Binding {
+    Action(EditorAction),
+    Host(String),
+    Unbound,
+}
+
+/// The readline-variable knobs, copied into each `read_line`'s state.
+#[derive(Debug, Clone, Copy, Default)]
+struct EditorConfig {
+    completion_ignore_case: bool,
+    show_all_if_ambiguous: bool,
+    menu_complete: bool,
+    bell: BellStyle,
+}
 
 /// How a [`Editor::read_line`] call ended.
 pub enum ReadResult {
@@ -134,12 +286,62 @@ pub enum ReadResult {
     Interrupted,
     /// Ctrl-D on an empty line.
     Eof,
+    /// The [`Editor::read_line_timeout`] deadline passed with no complete
+    /// line (bash's `$TMOUT`: "timed out waiting for input").
+    TimedOut,
+}
+
+/// Terminal size of stdout as `(columns, rows)`, or `None` when stdout is
+/// not a terminal (or on non-Unix builds). What a shell needs to keep
+/// `$COLUMNS`/`$LINES` fresh (bash 5's `checkwinsize` default).
+pub fn terminal_size() -> Option<(u16, u16)> {
+    #[cfg(unix)]
+    {
+        term_sys::term_size_stdout()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Run `f` with terminal echo off (a shell's `read -s`), restoring the
+/// previous state on every exit path — including a panic in `f` — via an
+/// internal RAII guard. When stdin is not a terminal there is no echo to
+/// disable and `f` simply runs.
+pub fn with_echo_disabled<T>(f: impl FnOnce() -> T) -> io::Result<T> {
+    #[cfg(unix)]
+    {
+        if !term_sys::isatty_stdin() {
+            return Ok(f());
+        }
+        /// Restores the saved attributes on drop.
+        struct EchoGuard(term_sys::Termios);
+        impl Drop for EchoGuard {
+            fn drop(&mut self) {
+                let _ = term_sys::tcsetattr_stdin_drain(&self.0);
+            }
+        }
+        let saved = term_sys::tcgetattr_stdin()?;
+        let mut silent = saved;
+        term_sys::clear_echo_flag(&mut silent);
+        term_sys::tcsetattr_stdin_drain(&silent)?;
+        let _guard = EchoGuard(saved);
+        Ok(f())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(f())
+    }
 }
 
 /// The line editor: owns the history and the kill ring, both of which
 /// persist across [`read_line`](Editor::read_line) calls within a session.
 pub struct Editor {
     history: Vec<String>,
+    /// Per-entry epoch timestamps, parallel to `history` (`None` for
+    /// entries loaded from a file without them).
+    timestamps: Vec<Option<i64>>,
     /// The kill ring (readline's): survives across lines within a session.
     kill_ring: Vec<String>,
     /// Cap on history entries (readline's `stifle_history`); oldest are
@@ -151,14 +353,31 @@ pub struct Editor {
     /// When set, a new entry erases earlier duplicates everywhere in the
     /// history, not just a consecutive repeat.
     dedup: bool,
+    /// When set, `save_history`/`append_history` write bash's `#<epoch>`
+    /// timestamp comment before each entry (`HISTTIMEFORMAT`'s format).
+    write_timestamps: bool,
+    /// Host rebindings, overlaid on the default keymap (emacs and
+    /// vi-insert modes; vi normal mode is not rebindable).
+    bindings: Vec<(Key, Binding)>,
+    /// The readline-variable knobs (`set_completion_ignore_case` …).
+    cfg: EditorConfig,
 }
 
-/// The piped-stdin path: one line, no prompt, no editing.
+/// The piped-stdin path: one line, no prompt, no editing. A deadline, if
+/// set, is honored between bytes via `poll`.
 #[cfg(unix)]
-fn read_line_plain() -> io::Result<ReadResult> {
+fn read_line_plain(deadline: Option<std::time::Instant>) -> io::Result<ReadResult> {
     let mut line = Vec::new();
     let mut b = [0u8; 1];
     loop {
+        if let Some(d) = deadline {
+            let Some(remaining) = d.checked_duration_since(std::time::Instant::now()) else {
+                return Ok(ReadResult::TimedOut);
+            };
+            if !term_sys::poll_stdin(remaining.as_millis().min(i32::MAX as u128) as i32) {
+                continue; // re-check the deadline, then poll again
+            }
+        }
         match io::stdin().read(&mut b) {
             Ok(0) => {
                 if line.is_empty() {
@@ -188,11 +407,101 @@ impl Editor {
     pub fn new() -> Self {
         Editor {
             history: Vec::new(),
+            timestamps: Vec::new(),
             kill_ring: Vec::new(),
             max_history: usize::MAX,
             persisted: 0,
             dedup: false,
+            write_timestamps: false,
+            bindings: Vec::new(),
+            cfg: EditorConfig::default(),
         }
+    }
+
+    /// Rebind `keys` to `action`, replacing the default (or a previous
+    /// rebinding) — readline's `bind '"\C-x": function'`. The key spec
+    /// accepts readline's spellings: `\C-x`, `\M-f`, `\e[1;5C`, plus the
+    /// usual backslash escapes. Bindings apply to the emacs and vi-insert
+    /// keymaps; vi normal mode is fixed. Errors on a spec that does not
+    /// parse to a single recognized key (multi-key chords are not
+    /// supported).
+    pub fn bind(&mut self, keys: &str, action: EditorAction) -> io::Result<()> {
+        self.bind_internal(keys, Binding::Action(action))
+    }
+
+    /// Bind `keys` to a host command — bash's `bind -x`. When the key is
+    /// pressed the editor suspends raw mode and calls
+    /// [`Hooks::host_binding`] with `tag` and the current line/cursor;
+    /// the host runs its command (with `READLINE_LINE`/`READLINE_POINT`
+    /// semantics), and whatever it writes back becomes the buffer.
+    pub fn bind_host(&mut self, keys: &str, tag: String) -> io::Result<()> {
+        self.bind_internal(keys, Binding::Host(tag))
+    }
+
+    /// Remove any binding for `keys` — including the default, so the key
+    /// does nothing (readline's `bind -r`). Rebind with
+    /// [`bind`](Editor::bind) to restore behavior.
+    pub fn unbind(&mut self, keys: &str) -> io::Result<()> {
+        self.bind_internal(keys, Binding::Unbound)
+    }
+
+    fn bind_internal(&mut self, keys: &str, binding: Binding) -> io::Result<()> {
+        let key = parse_key_spec(keys).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unparseable key spec: {keys:?}"),
+            )
+        })?;
+        if let Some(slot) = self.bindings.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = binding;
+        } else {
+            self.bindings.push((key, binding));
+        }
+        Ok(())
+    }
+
+    /// The current action bindings — defaults with rebindings applied —
+    /// as (key spec, action) pairs (a shell's `bind -P`). Host-command
+    /// bindings and self-inserting character keys are not listed.
+    pub fn bindings(&self) -> impl Iterator<Item = (String, EditorAction)> + '_ {
+        let defaults = DEFAULT_BINDINGS
+            .iter()
+            .filter(|(k, _)| !self.bindings.iter().any(|(ck, _)| ck == k))
+            .map(|(k, a)| (key_spec(k), *a));
+        let custom = self.bindings.iter().filter_map(|(k, b)| match b {
+            Binding::Action(a) => Some((key_spec(k), *a)),
+            _ => None,
+        });
+        defaults.chain(custom)
+    }
+
+    /// Case-insensitive completion matching (readline's
+    /// `completion-ignore-case`): the longest-common-prefix step compares
+    /// candidates ignoring case (the first candidate's case is inserted).
+    /// Off by default, like readline.
+    pub fn set_completion_ignore_case(&mut self, on: bool) {
+        self.cfg.completion_ignore_case = on;
+    }
+
+    /// List completion candidates immediately when a completion is
+    /// ambiguous, instead of on the second Tab (readline's
+    /// `show-all-if-ambiguous`). Off by default, like readline.
+    pub fn set_show_all_if_ambiguous(&mut self, on: bool) {
+        self.cfg.show_all_if_ambiguous = on;
+    }
+
+    /// Make Tab cycle through the candidates directly, inserting the
+    /// first match immediately (readline's `menu-complete` bound in place
+    /// of `complete`). Off by default, like readline.
+    pub fn set_menu_complete(&mut self, on: bool) {
+        self.cfg.menu_complete = on;
+    }
+
+    /// What ringing the bell does (readline's `bell-style`): audible
+    /// (the default, like readline), visible, or nothing. The editor
+    /// rings on completion with no candidates.
+    pub fn set_bell_style(&mut self, style: BellStyle) {
+        self.cfg.bell = style;
     }
 
     /// When enabled, adding an entry removes earlier duplicates anywhere
@@ -215,6 +524,7 @@ impl Editor {
         if self.history.len() > self.max_history {
             let excess = self.history.len() - self.max_history;
             self.history.drain(..excess);
+            self.timestamps.drain(..excess);
             self.persisted = self.persisted.saturating_sub(excess);
         }
     }
@@ -224,10 +534,37 @@ impl Editor {
         &self.history
     }
 
+    /// Per-entry epoch timestamps, parallel to [`history`](Editor::history)
+    /// — `None` for entries loaded from a file without them. What a shell's
+    /// `history` builtin renders through `strftime($HISTTIMEFORMAT)`.
+    pub fn history_timestamps(&self) -> &[Option<i64>] {
+        &self.timestamps
+    }
+
+    /// When enabled, `save_history` and `append_history` precede each entry
+    /// with bash's `#<epoch>` timestamp comment — the `HISTTIMEFORMAT` file
+    /// format. Off by default, so existing plain history files are not
+    /// rewritten into the timestamped format behind the user's back
+    /// (bash likewise writes timestamps only when `HISTTIMEFORMAT` is set).
+    /// `load_history` understands both formats regardless of this toggle.
+    pub fn set_history_timestamps(&mut self, on: bool) {
+        self.write_timestamps = on;
+    }
+
     /// Append to history, skipping a consecutive duplicate. A multi-line
     /// entry (a bracketed paste) is joined with `; ` — bash's `cmdhist`
     /// behavior — so recall and the line-oriented history file both work.
+    /// The entry is stamped with the current time (rendered to the file
+    /// only under [`set_history_timestamps`](Editor::set_history_timestamps)).
     pub fn add_history_entry(&mut self, line: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() as i64);
+        self.add_entry(line, now);
+    }
+
+    fn add_entry(&mut self, line: &str, timestamp: Option<i64>) {
         let entry = if line.contains('\n') {
             line.replace('\n', "; ")
         } else {
@@ -238,6 +575,7 @@ impl Editor {
             while i < self.history.len() {
                 if self.history[i] == entry {
                     self.history.remove(i);
+                    self.timestamps.remove(i);
                     // A removed entry below the persisted watermark shifts
                     // it down; the file keeps the stale copy until the next
                     // full save_history.
@@ -251,30 +589,82 @@ impl Editor {
         }
         if self.history.last() != Some(&entry) {
             self.history.push(entry);
+            self.timestamps.push(timestamp);
             self.trim_history();
         }
     }
 
-    /// Load history from `path` — plain lines; a leading `#V2` header (the
-    /// format `rustyline`'s `FileHistory` writes, for hosts migrating)
-    /// is skipped so an existing history file keeps working.
+    /// Replace the whole history in place — a shell resynchronizing after
+    /// its `history -c` / `history -d` builtin — without rebuilding the
+    /// editor (the kill ring and other session state survive). Entries are
+    /// treated as already persisted: a following `append_history` writes
+    /// only entries added *after* this call, mirroring bash, where deletion
+    /// edits the in-memory list and the file catches up on the next full
+    /// write. Timestamps are cleared (the caller's mirror is line-only).
+    pub fn replace_history(&mut self, entries: Vec<String>) {
+        self.history = entries
+            .into_iter()
+            .map(|e| {
+                if e.contains('\n') {
+                    e.replace('\n', "; ")
+                } else {
+                    e
+                }
+            })
+            .collect();
+        self.timestamps = vec![None; self.history.len()];
+        self.persisted = self.history.len();
+        self.trim_history();
+    }
+
+    /// Load history from `path`. Plain lines; a `#<epoch>` comment line
+    /// (bash's `HISTTIMEFORMAT` file format) stamps the entry that follows
+    /// it; a leading `#V2` header (the format `rustyline`'s `FileHistory`
+    /// writes, for hosts migrating) is skipped. Files with and without
+    /// timestamps both round-trip.
     pub fn load_history(&mut self, path: &std::path::Path) -> io::Result<()> {
         let text = std::fs::read_to_string(path)?;
+        let mut pending_ts: Option<i64> = None;
         for (i, line) in text.lines().enumerate() {
             if i == 0 && line == "#V2" {
                 continue;
             }
+            if let Some(digits) = line.strip_prefix('#')
+                && !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit())
+            {
+                pending_ts = digits.parse().ok();
+                continue;
+            }
             if !line.is_empty() {
-                self.add_history_entry(line);
+                self.add_entry(line, pending_ts.take());
             }
         }
         self.persisted = self.history.len();
         Ok(())
     }
 
-    /// Write the history to `path`, one entry per line.
+    /// One entry (or a `persisted..` tail) in the on-disk format:
+    /// `#<epoch>` comment lines only under `set_history_timestamps`.
+    fn format_entries(&self, from: usize) -> String {
+        let mut out = String::new();
+        for (entry, ts) in self.history[from..].iter().zip(&self.timestamps[from..]) {
+            if self.write_timestamps
+                && let Some(ts) = ts
+            {
+                out.push_str(&format!("#{ts}\n"));
+            }
+            out.push_str(entry);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Write the history to `path`, one entry per line (preceded by a
+    /// `#<epoch>` timestamp line when
+    /// [`set_history_timestamps`](Editor::set_history_timestamps) is on).
     pub fn save_history(&mut self, path: &std::path::Path) -> io::Result<()> {
-        std::fs::write(path, self.history.join("\n") + "\n")?;
+        std::fs::write(path, self.format_entries(0))?;
         self.persisted = self.history.len();
         Ok(())
     }
@@ -283,14 +673,14 @@ impl Editor {
     /// `save_history`, or `append_history` call — bash's `histappend`:
     /// concurrent sessions interleave instead of overwriting each other.
     pub fn append_history(&mut self, path: &std::path::Path) -> io::Result<()> {
-        let new = &self.history[self.persisted.min(self.history.len())..];
-        if !new.is_empty() {
+        let from = self.persisted.min(self.history.len());
+        if from < self.history.len() {
             use std::io::Write as _;
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)?;
-            f.write_all((new.join("\n") + "\n").as_bytes())?;
+            f.write_all(self.format_entries(from).as_bytes())?;
         }
         self.persisted = self.history.len();
         Ok(())
@@ -304,18 +694,36 @@ impl Editor {
         rprompt: &str,
         hooks: &dyn Hooks,
     ) -> io::Result<ReadResult> {
+        self.read_line_timeout(prompt, rprompt, hooks, None)
+    }
+
+    /// [`read_line`](Editor::read_line) with a deadline: when no complete
+    /// line has been entered within `timeout` (measured from the call, not
+    /// from the last keystroke — readline's `rl_readline_state` timeout,
+    /// bash's `$TMOUT`), returns [`ReadResult::TimedOut`]. `None` never
+    /// times out. On non-Unix builds the timeout is ignored (the fallback
+    /// is a blocking buffered read).
+    pub fn read_line_timeout(
+        &mut self,
+        prompt: &str,
+        rprompt: &str,
+        hooks: &dyn Hooks,
+        timeout: Option<std::time::Duration>,
+    ) -> io::Result<ReadResult> {
         #[cfg(unix)]
         {
+            let deadline = timeout.map(|t| std::time::Instant::now() + t);
             // A non-tty stdin (a script piped into an "interactive"
             // host) can't enter raw mode; fall back to a plain silent
             // read, like readline does.
             if !term_sys::isatty_stdin() {
-                return read_line_plain();
+                return read_line_plain(deadline);
             }
-            read_line_raw(self, prompt, rprompt, hooks)
+            read_line_raw(self, prompt, rprompt, hooks, deadline)
         }
         #[cfg(not(unix))]
         {
+            let _ = timeout;
             // No raw terminal on this platform: a plain buffered read
             // with no editing — a documented narrowing.
             let _ = (rprompt, hooks);
@@ -334,7 +742,6 @@ impl Editor {
 }
 
 /// One decoded input event.
-#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Key {
     Char(char),
@@ -478,7 +885,6 @@ fn read_utf8(hooks: &dyn Hooks, first: u8) -> io::Result<char> {
 /// Map a CSI escape sequence's final byte (plus parameters) to a key —
 /// pure, so the quirk table is unit-testable. Modifier parameters `1;5`
 /// (Ctrl) and `1;3` (Alt) on the arrows become word motions.
-#[cfg(unix)]
 fn csi_key(params: &str, final_byte: u8) -> Key {
     match (params, final_byte) {
         ("1;5" | "1;3", b'C') => Key::WordRight,
@@ -495,6 +901,254 @@ fn csi_key(params: &str, final_byte: u8) -> Key {
         ("5", b'~') => Key::PageUp,
         ("6", b'~') => Key::PageDown,
         _ => Key::Other,
+    }
+}
+
+/// The default emacs / vi-insert keymap, as data: what dispatch consults
+/// for an unrebound key, and what [`Editor::bindings`] lists. Character
+/// keys (self-insert) and the hardcoded C-x chord prefix are not rows.
+static DEFAULT_BINDINGS: &[(Key, EditorAction)] = &[
+    (Key::Enter, EditorAction::AcceptLine),
+    (Key::Ctrl('c'), EditorAction::Interrupt),
+    (Key::Ctrl('d'), EditorAction::DeleteCharOrEof),
+    (Key::Delete, EditorAction::DeleteChar),
+    // C-h arrives as the 0x08 Backspace byte, so it is the same row.
+    (Key::Backspace, EditorAction::BackwardDeleteChar),
+    (Key::Home, EditorAction::BeginningOfLine),
+    (Key::Ctrl('a'), EditorAction::BeginningOfLine),
+    (Key::End, EditorAction::EndOfLine),
+    (Key::Ctrl('e'), EditorAction::EndOfLine),
+    (Key::Right, EditorAction::ForwardChar),
+    (Key::Ctrl('f'), EditorAction::ForwardChar),
+    (Key::Left, EditorAction::BackwardChar),
+    (Key::Ctrl('b'), EditorAction::BackwardChar),
+    (Key::WordRight, EditorAction::ForwardWord),
+    (Key::Alt('f'), EditorAction::ForwardWord),
+    (Key::WordLeft, EditorAction::BackwardWord),
+    (Key::Alt('b'), EditorAction::BackwardWord),
+    (Key::Ctrl('k'), EditorAction::KillLine),
+    (Key::Ctrl('u'), EditorAction::UnixLineDiscard),
+    (Key::Ctrl('w'), EditorAction::UnixWordRubout),
+    (Key::Alt('d'), EditorAction::KillWord),
+    (Key::AltBackspace, EditorAction::BackwardKillWord),
+    (Key::Ctrl('y'), EditorAction::Yank),
+    (Key::Alt('y'), EditorAction::YankPop),
+    (Key::Ctrl('t'), EditorAction::TransposeChars),
+    (Key::Alt('t'), EditorAction::TransposeWords),
+    (Key::Alt('u'), EditorAction::UpcaseWord),
+    (Key::Alt('l'), EditorAction::DowncaseWord),
+    (Key::Alt('c'), EditorAction::CapitalizeWord),
+    (Key::Ctrl('_'), EditorAction::Undo),
+    (Key::Ctrl('z'), EditorAction::Undo),
+    (Key::Alt('r'), EditorAction::RevertLine),
+    (Key::Alt('.'), EditorAction::InsertLastArgument),
+    (Key::Alt('_'), EditorAction::InsertLastArgument),
+    (Key::Up, EditorAction::PreviousHistory),
+    (Key::Ctrl('p'), EditorAction::PreviousHistory),
+    (Key::Down, EditorAction::NextHistory),
+    (Key::Ctrl('n'), EditorAction::NextHistory),
+    (Key::Alt('<'), EditorAction::BeginningOfHistory),
+    (Key::Alt('>'), EditorAction::EndOfHistory),
+    (Key::PageUp, EditorAction::HistorySearchBackward),
+    (Key::Alt('p'), EditorAction::HistorySearchBackward),
+    (Key::PageDown, EditorAction::HistorySearchForward),
+    (Key::Alt('n'), EditorAction::HistorySearchForward),
+    (Key::Ctrl('r'), EditorAction::ReverseSearchHistory),
+    (Key::Ctrl('s'), EditorAction::ForwardSearchHistory),
+    (Key::Ctrl('l'), EditorAction::ClearScreen),
+    (Key::Tab, EditorAction::Complete),
+    (Key::Ctrl('v'), EditorAction::QuotedInsert),
+    (Key::Ctrl('q'), EditorAction::QuotedInsert),
+];
+
+/// The default action for a key: character keys self-insert, everything
+/// else comes from the [`DEFAULT_BINDINGS`] table.
+fn default_action(key: &Key) -> Option<EditorAction> {
+    if matches!(key, Key::Char(_)) {
+        return Some(EditorAction::SelfInsert);
+    }
+    DEFAULT_BINDINGS
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, a)| *a)
+}
+
+/// Parse a readline key spec — `\C-x`, `\M-f`, `\e[1;5C`, backslash
+/// escapes (`\e \t \r \n \a \d \\ \xHH \NNN`), plain characters — into
+/// the single key it decodes to. `None` for anything unparseable,
+/// including multi-key chords.
+fn parse_key_spec(spec: &str) -> Option<Key> {
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chars = spec.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next()? {
+            'C' => {
+                if chars.next()? != '-' {
+                    return None;
+                }
+                // The control target may itself be escaped (`\C-\\`).
+                let t = match chars.next()? {
+                    '\\' => chars.next()?,
+                    t => t,
+                };
+                bytes.push(match t {
+                    '?' => 0x7f,
+                    t if t.is_ascii() => (t as u8) & 0x1f,
+                    _ => return None,
+                });
+            }
+            // Meta is an ESC prefix; the rest of the spec parses as
+            // usual, so `\M-\C-?` works.
+            'M' => {
+                if chars.next()? != '-' {
+                    return None;
+                }
+                bytes.push(0x1b);
+            }
+            'e' | 'E' => bytes.push(0x1b),
+            '\\' => bytes.push(b'\\'),
+            'a' => bytes.push(0x07),
+            'b' => bytes.push(0x08),
+            'd' => bytes.push(0x7f),
+            'f' => bytes.push(0x0c),
+            'n' => bytes.push(b'\n'),
+            'r' => bytes.push(b'\r'),
+            't' => bytes.push(b'\t'),
+            'v' => bytes.push(0x0b),
+            'x' => {
+                let mut v: u32 = 0;
+                let mut seen = 0;
+                while seen < 2
+                    && let Some(d) = chars.peek().and_then(|c| c.to_digit(16))
+                {
+                    v = v * 16 + d;
+                    chars.next();
+                    seen += 1;
+                }
+                if seen == 0 {
+                    return None;
+                }
+                bytes.push(v as u8);
+            }
+            d @ '0'..='7' => {
+                let mut v: u32 = d.to_digit(8).unwrap();
+                let mut seen = 1;
+                while seen < 3
+                    && let Some(d) = chars.peek().and_then(|c| c.to_digit(8))
+                {
+                    v = v * 8 + d;
+                    chars.next();
+                    seen += 1;
+                }
+                if v > 0xff {
+                    return None;
+                }
+                bytes.push(v as u8);
+            }
+            _ => return None,
+        }
+    }
+    decode_key_bytes(&bytes)
+}
+
+/// Decode a complete byte sequence into exactly one key — the pure twin
+/// of [`read_key`]'s streaming decoder, for the binding parser. `None`
+/// when the bytes are empty, leave a remainder, or decode to nothing
+/// recognizable.
+fn decode_key_bytes(bytes: &[u8]) -> Option<Key> {
+    let (&b, rest) = bytes.split_first()?;
+    let one = |key: Key| if rest.is_empty() { Some(key) } else { None };
+    match b {
+        b'\r' | b'\n' => one(Key::Enter),
+        b'\t' => one(Key::Tab),
+        0x7f | 0x08 => one(Key::Backspace),
+        0x1b => decode_escape_bytes(rest),
+        0x1f => one(Key::Ctrl('_')),
+        0x01..=0x1a => one(Key::Ctrl((b - 1 + b'a') as char)),
+        _ => {
+            let s = std::str::from_utf8(bytes).ok()?;
+            let mut chars = s.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            Some(Key::Char(c))
+        }
+    }
+}
+
+/// The post-ESC half of [`decode_key_bytes`].
+fn decode_escape_bytes(rest: &[u8]) -> Option<Key> {
+    let Some((&b, rest)) = rest.split_first() else {
+        return Some(Key::Esc);
+    };
+    let one = |key: Key| if rest.is_empty() { Some(key) } else { None };
+    match b {
+        b'[' => {
+            let params_len = rest
+                .iter()
+                .take_while(|&&c| c.is_ascii_digit() || c == b';')
+                .count();
+            let (params, fin) = rest.split_at(params_len);
+            let (&final_byte, tail) = fin.split_first()?;
+            if !tail.is_empty() {
+                return None;
+            }
+            match csi_key(std::str::from_utf8(params).ok()?, final_byte) {
+                Key::Other => None,
+                key => Some(key),
+            }
+        }
+        b'O' => {
+            let (&f, tail) = rest.split_first()?;
+            if !tail.is_empty() {
+                return None;
+            }
+            match f {
+                b'H' => Some(Key::Home),
+                b'F' => Some(Key::End),
+                b'A' => Some(Key::Up),
+                b'B' => Some(Key::Down),
+                b'C' => Some(Key::Right),
+                b'D' => Some(Key::Left),
+                _ => None,
+            }
+        }
+        0x7f => one(Key::AltBackspace),
+        c if c.is_ascii_graphic() => one(Key::Alt(c as char)),
+        _ => None,
+    }
+}
+
+/// Render a key back to a readline-style spec — [`Editor::bindings`]'s
+/// output, chosen so it round-trips through [`parse_key_spec`].
+fn key_spec(key: &Key) -> String {
+    match key {
+        Key::Char(c) => c.to_string(),
+        Key::Ctrl(c) => format!("\\C-{c}"),
+        Key::Alt(c) => format!("\\M-{c}"),
+        Key::AltBackspace => "\\M-\\C-?".to_string(),
+        Key::Enter => "\\C-m".to_string(),
+        Key::Tab => "\\C-i".to_string(),
+        Key::Backspace => "\\C-?".to_string(),
+        Key::Delete => "\\e[3~".to_string(),
+        Key::Up => "\\e[A".to_string(),
+        Key::Down => "\\e[B".to_string(),
+        Key::Right => "\\e[C".to_string(),
+        Key::Left => "\\e[D".to_string(),
+        Key::Home => "\\e[H".to_string(),
+        Key::End => "\\e[F".to_string(),
+        Key::WordLeft => "\\e[1;5D".to_string(),
+        Key::WordRight => "\\e[1;5C".to_string(),
+        Key::PageUp => "\\e[5~".to_string(),
+        Key::PageDown => "\\e[6~".to_string(),
+        Key::Esc => "\\e".to_string(),
+        Key::Paste(_) | Key::Other => String::new(),
     }
 }
 
@@ -675,6 +1329,8 @@ struct LineState<'a> {
     /// Completion menu cycling state, armed by the candidate list and
     /// cleared by any non-Tab key.
     menu: Option<MenuState>,
+    /// The editor's readline-variable knobs, copied per read_line.
+    cfg: EditorConfig,
     hooks: &'a dyn Hooks,
 }
 
@@ -706,11 +1362,16 @@ fn read_line_raw(
     prompt: &str,
     rprompt: &str,
     hooks: &dyn Hooks,
+    deadline: Option<std::time::Instant>,
 ) -> io::Result<ReadResult> {
     let raw = RawMode::enable()?;
     let _paste = BracketedPaste::enable();
+    let cfg = ed.cfg;
     let Editor {
-        history, kill_ring, ..
+        history,
+        kill_ring,
+        bindings,
+        ..
     } = ed;
     let mut st = LineState {
         buffer: String::new(),
@@ -736,6 +1397,7 @@ fn read_line_raw(
         yank: None,
         lastarg: None,
         menu: None,
+        cfg,
         hooks,
     };
     render(&mut st, history)?;
@@ -745,8 +1407,18 @@ fn read_line_raw(
         // Idle wait: repaint if the terminal was resized while sitting at
         // the prompt (no SIGWINCH handler — the 200ms poll tick notices).
         // The tick also gives the host a beat to fire pending signal traps
-        // even when no input arrives to interrupt.
-        while !input_ready(200) {
+        // even when no input arrives to interrupt. The read_line_timeout
+        // deadline is checked on the same tick (and between keystrokes).
+        loop {
+            if let Some(d) = deadline
+                && std::time::Instant::now() >= d
+            {
+                finish_line(&mut st)?;
+                return Ok(ReadResult::TimedOut);
+            }
+            if input_ready(200) {
+                break;
+            }
             hooks.on_interrupted_read();
             let now = term_cols();
             if now != cols {
@@ -778,87 +1450,109 @@ fn read_line_raw(
         let snapshot = (st.buffer.clone(), st.cursor);
         st.this_action = Action::Other;
 
-        // Any key but Tab ends candidate cycling.
-        if !matches!(key, Key::Tab) {
+        // Any key ends candidate cycling, unless it performs completion
+        // itself (Tab by default; rebindable).
+        if !key_completes(&key, bindings, st.vi && st.vi_normal) {
             st.menu = None;
         }
 
-        match key {
-            Key::Enter => {
+        let after = if st.vi && st.vi_normal {
+            // vi normal mode is a fixed keymap; only the global controls
+            // (line termination, search, undo, C-x chords, quoted insert,
+            // `v` external edit) are shared with the binding path.
+            match key {
+                Key::Enter => AfterKey::Accept,
+                Key::Ctrl('c') => AfterKey::Interrupted,
+                Key::Ctrl('d') if st.buffer.is_empty() => AfterKey::Eof,
+                Key::Ctrl('r') => {
+                    start_search(&mut st, false);
+                    AfterKey::Done
+                }
+                Key::Ctrl('s') => {
+                    start_search(&mut st, true);
+                    AfterKey::Done
+                }
+                Key::Ctrl('l') => {
+                    clear_screen(&mut st);
+                    AfterKey::Done
+                }
+                Key::Ctrl('_') | Key::Ctrl('z') => {
+                    undo_cmd(&mut st);
+                    AfterKey::Done
+                }
+                Key::Ctrl('x') => ctrl_x_chord(&mut st)?,
+                Key::Ctrl('v') | Key::Ctrl('q') => {
+                    quoted_insert(&mut st)?;
+                    AfterKey::Done
+                }
+                Key::Tab => run_action(&mut st, EditorAction::Complete, &key, history, kill_ring)?,
+                Key::Char('v') if st.vi_op.is_none() && st.vi_find.is_none() && !st.vi_replace => {
+                    // vi normal-mode `v`: edit the line in $EDITOR,
+                    // readline's own vi binding.
+                    AfterKey::External
+                }
+                key => {
+                    handle_vi_normal(&mut st, key, history, kill_ring);
+                    AfterKey::Done
+                }
+            }
+        } else {
+            match key {
+                Key::Paste(s) => {
+                    // Insert the paste verbatim (normalizing line
+                    // endings) — no completion, no abbreviations, no
+                    // history motion, no bindings.
+                    let s = s.replace("\r\n", "\n").replace('\r', "\n");
+                    st.buffer.insert_str(st.cursor, &s);
+                    st.cursor += s.len();
+                    AfterKey::Done
+                }
+                Key::Esc if st.vi => {
+                    st.vi_normal = true;
+                    // vi leaves the cursor on the last inserted character.
+                    if let Some(prev) = prev_char_start(&st.buffer, st.cursor) {
+                        st.cursor = prev;
+                    }
+                    AfterKey::Done
+                }
+                // Emacs / vi-insert: host rebindings first, then the
+                // default keymap.
+                key => match bindings.iter().find(|(k, _)| *k == key) {
+                    Some((_, Binding::Unbound)) => AfterKey::Done,
+                    Some((_, Binding::Host(tag))) => {
+                        run_host_binding(&mut st, &raw, tag)?;
+                        AfterKey::Done
+                    }
+                    Some((_, Binding::Action(action))) => {
+                        run_action(&mut st, *action, &key, history, kill_ring)?
+                    }
+                    None if key == Key::Ctrl('x') => ctrl_x_chord(&mut st)?,
+                    None => match default_action(&key) {
+                        Some(action) => run_action(&mut st, action, &key, history, kill_ring)?,
+                        None => AfterKey::Done,
+                    },
+                },
+            }
+        };
+        match after {
+            AfterKey::Done => {}
+            AfterKey::Accept => {
                 finish_line(&mut st)?;
                 return Ok(ReadResult::Line(st.buffer));
             }
-            Key::Ctrl('c') => {
+            AfterKey::Interrupted => {
                 finish_line(&mut st)?;
                 return Ok(ReadResult::Interrupted);
             }
-            Key::Ctrl('d') if st.buffer.is_empty() => {
+            AfterKey::Eof => {
                 finish_line(&mut st)?;
                 return Ok(ReadResult::Eof);
             }
-            Key::Ctrl('r') => {
-                st.search = Some(SearchState {
-                    query: String::new(),
-                    hit: None,
-                    forward: false,
-                });
-            }
-            Key::Ctrl('s') => {
-                st.search = Some(SearchState {
-                    query: String::new(),
-                    hit: None,
-                    forward: true,
-                });
-            }
-            Key::Ctrl('l') => {
-                print!("\x1b[2J\x1b[H");
-                st.painted_rows = 1;
-                st.painted_cursor_row = 0;
-            }
-            Key::Ctrl('_') | Key::Ctrl('z') => undo_cmd(&mut st),
-            Key::Ctrl('x') => {
-                // The readline C-x chords supported: C-x C-e (edit the
-                // line in $EDITOR) and C-x C-u (undo).
-                match read_key(hooks)? {
-                    Some(Key::Ctrl('e')) => {
-                        if let Some(line) = edit_in_editor(&mut st, &raw)? {
-                            return Ok(ReadResult::Line(line));
-                        }
-                    }
-                    Some(Key::Ctrl('u')) => undo_cmd(&mut st),
-                    _ => {}
-                }
-            }
-            Key::Ctrl('v') | Key::Ctrl('q') => quoted_insert(&mut st)?,
-            Key::Char('v')
-                if st.vi
-                    && st.vi_normal
-                    && st.vi_op.is_none()
-                    && st.vi_find.is_none()
-                    && !st.vi_replace =>
-            {
-                // vi normal-mode `v`: edit the line in $EDITOR, readline's
-                // own vi binding.
+            AfterKey::External => {
                 if let Some(line) = edit_in_editor(&mut st, &raw)? {
                     return Ok(ReadResult::Line(line));
                 }
             }
-            Key::Tab => {
-                if st.menu.is_some() {
-                    menu_next(&mut st);
-                } else {
-                    complete_at_cursor(&mut st)?;
-                }
-            }
-            Key::Paste(s) => {
-                // Insert the paste verbatim (normalizing line endings) —
-                // no completion, no abbreviations, no history motion.
-                let s = s.replace("\r\n", "\n").replace('\r', "\n");
-                st.buffer.insert_str(st.cursor, &s);
-                st.cursor += s.len();
-            }
-            key if st.vi && st.vi_normal => handle_vi_normal(&mut st, key, history, kill_ring),
-            key => handle_insert(&mut st, key, history, kill_ring),
         }
 
         // Undo bookkeeping: snapshot any mutation, coalescing runs of
@@ -890,48 +1584,150 @@ fn finish_line(st: &mut LineState) -> io::Result<()> {
     io::stdout().flush()
 }
 
-/// The emacs (and vi-insert) key handling.
+/// Whether a key resolves to a completion action — the one case that
+/// must not tear down the menu-cycling state before dispatch.
 #[cfg(unix)]
-fn handle_insert(st: &mut LineState, key: Key, history: &[String], ring: &mut Vec<String>) {
-    match key {
-        Key::Esc if st.vi => {
-            st.vi_normal = true;
-            // vi leaves the cursor on the last inserted character.
-            if let Some(prev) = prev_char_start(&st.buffer, st.cursor) {
-                st.cursor = prev;
-            }
+fn key_completes(key: &Key, bindings: &[(Key, Binding)], vi_normal: bool) -> bool {
+    if vi_normal {
+        // vi normal mode's keymap is fixed: only Tab completes there.
+        return *key == Key::Tab;
+    }
+    let action = match bindings.iter().find(|(k, _)| k == key) {
+        Some((_, Binding::Action(a))) => Some(*a),
+        Some(_) => None,
+        None => default_action(key),
+    };
+    matches!(
+        action,
+        Some(EditorAction::Complete | EditorAction::MenuComplete)
+    )
+}
+
+/// What the main loop does after a key's action ran: nothing, end the
+/// read (three ways), or hand the line to the external editor (which
+/// needs the loop's `RawMode` handle).
+#[cfg(unix)]
+enum AfterKey {
+    Done,
+    Accept,
+    Interrupted,
+    Eof,
+    External,
+}
+
+/// Enter C-r / C-s incremental search.
+#[cfg(unix)]
+fn start_search(st: &mut LineState, forward: bool) {
+    st.search = Some(SearchState {
+        query: String::new(),
+        hit: None,
+        forward,
+    });
+}
+
+/// C-l: clear the screen; the next render repaints at the top.
+#[cfg(unix)]
+fn clear_screen(st: &mut LineState) {
+    print!("\x1b[2J\x1b[H");
+    st.painted_rows = 1;
+    st.painted_cursor_row = 0;
+}
+
+/// The readline C-x chords supported: C-x C-e (edit the line in
+/// $EDITOR) and C-x C-u (undo).
+#[cfg(unix)]
+fn ctrl_x_chord(st: &mut LineState) -> io::Result<AfterKey> {
+    Ok(match read_key(st.hooks)? {
+        Some(Key::Ctrl('e')) => AfterKey::External,
+        Some(Key::Ctrl('u')) => {
+            undo_cmd(st);
+            AfterKey::Done
         }
-        Key::Char(' ') => {
+        _ => AfterKey::Done,
+    })
+}
+
+/// Ring the terminal bell per the configured style.
+#[cfg(unix)]
+fn bell(style: BellStyle) -> io::Result<()> {
+    match style {
+        BellStyle::None => return Ok(()),
+        BellStyle::Audible => print!("\x07"),
+        // Reverse-video flip — the flash without terminfo's `flash`.
+        BellStyle::Visible => print!("\x1b[?5h\x1b[?5l"),
+    }
+    io::stdout().flush()
+}
+
+/// A `bind_host` key: suspend raw mode, hand the line and cursor to the
+/// host (bash's `bind -x`, `READLINE_LINE`/`READLINE_POINT`), take back
+/// whatever it wrote, and repaint on a fresh region.
+#[cfg(unix)]
+fn run_host_binding(st: &mut LineState, raw: &RawMode, tag: &str) -> io::Result<()> {
+    finish_line(st)?;
+    raw.suspend();
+    let mut line = std::mem::take(&mut st.buffer);
+    let mut cursor = st.cursor;
+    st.hooks.host_binding(tag, &mut line, &mut cursor);
+    raw.resume();
+    st.buffer = line;
+    st.cursor = cursor.min(st.buffer.len());
+    while !st.buffer.is_char_boundary(st.cursor) {
+        st.cursor -= 1;
+    }
+    st.painted_rows = 1;
+    st.painted_cursor_row = 0;
+    Ok(())
+}
+
+/// Execute one named action — the emacs (and vi-insert) command set.
+/// `key` supplies the character for `SelfInsert`.
+#[cfg(unix)]
+fn run_action(
+    st: &mut LineState,
+    action: EditorAction,
+    key: &Key,
+    history: &[String],
+    ring: &mut Vec<String>,
+) -> io::Result<AfterKey> {
+    match action {
+        EditorAction::AcceptLine => return Ok(AfterKey::Accept),
+        EditorAction::Interrupt => return Ok(AfterKey::Interrupted),
+        EditorAction::DeleteCharOrEof if st.buffer.is_empty() => return Ok(AfterKey::Eof),
+        EditorAction::EditAndExecuteCommand => return Ok(AfterKey::External),
+        EditorAction::SelfInsert => {
+            let &Key::Char(c) = key else {
+                return Ok(AfterKey::Done); // only character keys self-insert
+            };
             // Abbreviations (fish-style): a space after one defined in
             // command position rewrites it in place first.
-            if let Some((start, expansion)) = st.hooks.expand_abbreviation(&st.buffer, st.cursor) {
+            if c == ' '
+                && let Some((start, expansion)) =
+                    st.hooks.expand_abbreviation(&st.buffer, st.cursor)
+            {
                 st.buffer.replace_range(start..st.cursor, &expansion);
                 st.cursor = start + expansion.len();
             }
-            insert_char(st, ' ');
-            st.this_action = Action::Insert;
-        }
-        Key::Char(c) => {
             insert_char(st, c);
             st.this_action = Action::Insert;
         }
-        Key::Backspace | Key::Ctrl('h') => {
+        EditorAction::BackwardDeleteChar => {
             if let Some(prev) = prev_char_start(&st.buffer, st.cursor) {
                 st.buffer.replace_range(prev..st.cursor, "");
                 st.cursor = prev;
             }
         }
-        Key::Delete | Key::Ctrl('d') => {
+        EditorAction::DeleteChar | EditorAction::DeleteCharOrEof => {
             if let Some(next) = next_char_end(&st.buffer, st.cursor) {
                 st.buffer.replace_range(st.cursor..next, "");
             }
         }
-        Key::Left | Key::Ctrl('b') => {
+        EditorAction::BackwardChar => {
             if let Some(prev) = prev_char_start(&st.buffer, st.cursor) {
                 st.cursor = prev;
             }
         }
-        Key::Right | Key::Ctrl('f') => {
+        EditorAction::ForwardChar => {
             // At end of line, the right arrow accepts the history hint.
             if st.cursor == st.buffer.len() {
                 if let Some(hint) = st.hooks.hint(&st.buffer, history) {
@@ -942,8 +1738,8 @@ fn handle_insert(st: &mut LineState, key: Key, history: &[String], ring: &mut Ve
                 st.cursor = next;
             }
         }
-        Key::Home | Key::Ctrl('a') => st.cursor = 0,
-        Key::End | Key::Ctrl('e') => {
+        EditorAction::BeginningOfLine => st.cursor = 0,
+        EditorAction::EndOfLine => {
             // End at end-of-line also accepts the hint (fish's behavior).
             if st.cursor == st.buffer.len()
                 && let Some(hint) = st.hooks.hint(&st.buffer, history)
@@ -952,8 +1748,8 @@ fn handle_insert(st: &mut LineState, key: Key, history: &[String], ring: &mut Ve
             }
             st.cursor = st.buffer.len();
         }
-        Key::WordLeft | Key::Alt('b') => st.cursor = word_back_alnum(&st.buffer, st.cursor),
-        Key::WordRight | Key::Alt('f') => {
+        EditorAction::BackwardWord => st.cursor = word_back_alnum(&st.buffer, st.cursor),
+        EditorAction::ForwardWord => {
             // At end of line, accept one word of the history hint
             // (fish's forward-word on an autosuggestion).
             if st.cursor == st.buffer.len() {
@@ -966,29 +1762,30 @@ fn handle_insert(st: &mut LineState, key: Key, history: &[String], ring: &mut Ve
                 st.cursor = word_forward_alnum(&st.buffer, st.cursor);
             }
         }
-        Key::Ctrl('k') => kill_span(st, ring, st.cursor, st.buffer.len(), true),
-        Key::Ctrl('u') => kill_span(st, ring, 0, st.cursor, false),
-        Key::Ctrl('w') => {
+        EditorAction::KillLine => kill_span(st, ring, st.cursor, st.buffer.len(), true),
+        EditorAction::UnixLineDiscard => kill_span(st, ring, 0, st.cursor, false),
+        EditorAction::UnixWordRubout => {
             // unix-word-rubout: whitespace-delimited, unlike M-Backspace.
             let start = word_back(&st.buffer, st.cursor);
             kill_span(st, ring, start, st.cursor, false);
         }
-        Key::Alt('d') => {
+        EditorAction::KillWord => {
             let end = word_forward_alnum(&st.buffer, st.cursor);
             kill_span(st, ring, st.cursor, end, true);
         }
-        Key::AltBackspace => {
+        EditorAction::BackwardKillWord => {
             let start = word_back_alnum(&st.buffer, st.cursor);
             kill_span(st, ring, start, st.cursor, false);
         }
-        Key::Ctrl('y') => yank(st, ring),
-        Key::Alt('y') => yank_pop(st, ring),
-        Key::Ctrl('t') => transpose(st),
-        Key::Alt('t') => transpose_words(st),
-        Key::Alt('u') => case_word(st, CaseOp::Upper),
-        Key::Alt('l') => case_word(st, CaseOp::Lower),
-        Key::Alt('c') => case_word(st, CaseOp::Capital),
-        Key::Alt('r') => {
+        EditorAction::Yank => yank(st, ring),
+        EditorAction::YankPop => yank_pop(st, ring),
+        EditorAction::TransposeChars => transpose(st),
+        EditorAction::TransposeWords => transpose_words(st),
+        EditorAction::UpcaseWord => case_word(st, CaseOp::Upper),
+        EditorAction::DowncaseWord => case_word(st, CaseOp::Lower),
+        EditorAction::CapitalizeWord => case_word(st, CaseOp::Capital),
+        EditorAction::Undo => undo_cmd(st),
+        EditorAction::RevertLine => {
             // readline revert-line: undo every edit to this line at once.
             if let Some((buf, cur)) = st.undo.first().cloned() {
                 st.cursor = cur.min(buf.len());
@@ -997,15 +1794,35 @@ fn handle_insert(st: &mut LineState, key: Key, history: &[String], ring: &mut Ve
             }
             st.this_action = Action::Undo; // don't snapshot the revert
         }
-        Key::Alt('.') | Key::Alt('_') => insert_last_arg(st, history),
-        Key::Alt('<') => history_first(st, history),
-        Key::Alt('>') => history_last(st),
-        Key::Up | Key::Ctrl('p') => history_prev(st, history),
-        Key::Down | Key::Ctrl('n') => history_next(st, history),
-        Key::PageUp | Key::Alt('p') => history_prefix_prev(st, history),
-        Key::PageDown | Key::Alt('n') => history_prefix_next(st, history),
-        _ => {}
+        EditorAction::InsertLastArgument => insert_last_arg(st, history),
+        EditorAction::BeginningOfHistory => history_first(st, history),
+        EditorAction::EndOfHistory => history_last(st),
+        EditorAction::PreviousHistory => history_prev(st, history),
+        EditorAction::NextHistory => history_next(st, history),
+        EditorAction::HistorySearchBackward => history_prefix_prev(st, history),
+        EditorAction::HistorySearchForward => history_prefix_next(st, history),
+        EditorAction::ReverseSearchHistory => start_search(st, false),
+        EditorAction::ForwardSearchHistory => start_search(st, true),
+        EditorAction::ClearScreen => clear_screen(st),
+        EditorAction::Complete => {
+            if st.menu.is_some() {
+                menu_next(st);
+            } else if st.cfg.menu_complete {
+                menu_complete_start(st)?;
+            } else {
+                complete_at_cursor(st)?;
+            }
+        }
+        EditorAction::MenuComplete => {
+            if st.menu.is_some() {
+                menu_next(st);
+            } else {
+                menu_complete_start(st)?;
+            }
+        }
+        EditorAction::QuotedInsert => quoted_insert(st)?,
     }
+    Ok(AfterKey::Done)
 }
 
 /// vi normal mode: counts, the `d`/`c`/`y` operators over motions
@@ -1923,19 +2740,24 @@ fn history_prefix_next(st: &mut LineState, history: &[String]) {
 fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
     let (start, candidates) = st.hooks.complete(&st.buffer, st.cursor);
     if candidates.is_empty() {
-        return Ok(());
+        return bell(st.cfg.bell);
     }
-    let lcp = longest_common_prefix(
+    let lcp = common_prefix(
         &candidates
             .iter()
             .map(|c| c.replacement.as_str())
             .collect::<Vec<_>>(),
+        st.cfg.completion_ignore_case,
     );
     let current = &st.buffer[start..st.cursor];
     if lcp.len() > current.len() {
         st.buffer.replace_range(start..st.cursor, &lcp);
         st.cursor = start + lcp.len();
-        return Ok(());
+        // show-all-if-ambiguous (readline): list right away instead of
+        // waiting for a second Tab after the prefix insertion.
+        if !(st.cfg.show_all_if_ambiguous && candidates.len() > 1) {
+            return Ok(());
+        }
     }
     if candidates.len() > 1 {
         // Leave the edit region and print the columned list; the next
@@ -1964,6 +2786,25 @@ fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
             candidates,
         });
     }
+    Ok(())
+}
+
+/// readline `menu-complete` (also Tab under `set_menu_complete`): insert
+/// the first candidate immediately and arm cycling — no LCP step, no
+/// candidate list.
+#[cfg(unix)]
+fn menu_complete_start(st: &mut LineState) -> io::Result<()> {
+    let (start, candidates) = st.hooks.complete(&st.buffer, st.cursor);
+    if candidates.is_empty() {
+        return bell(st.cfg.bell);
+    }
+    st.menu = Some(MenuState {
+        start,
+        inserted: st.cursor - start,
+        index: None,
+        candidates,
+    });
+    menu_next(st);
     Ok(())
 }
 
@@ -2001,6 +2842,33 @@ fn longest_common_prefix(names: &[&str]) -> String {
         }
     }
     prefix
+}
+
+/// `longest_common_prefix`, optionally case-insensitive (readline's
+/// `completion-ignore-case`): candidates are compared ignoring case and
+/// the first candidate's spelling is what gets inserted.
+fn common_prefix(names: &[&str], ignore_case: bool) -> String {
+    if !ignore_case {
+        return longest_common_prefix(names);
+    }
+    let Some(first) = names.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for name in &names[1..] {
+        let mut common = 0;
+        for (a, b) in first[..end].chars().zip(name.chars()) {
+            if a != b && !a.to_lowercase().eq(b.to_lowercase()) {
+                break;
+            }
+            common += a.len_utf8();
+        }
+        end = common;
+        if end == 0 {
+            break;
+        }
+    }
+    first[..end].to_string()
 }
 
 /// Repaint the whole edit region and reposition the cursor.
@@ -2128,6 +2996,7 @@ mod tests {
             yank: None,
             lastarg: None,
             menu: None,
+            cfg: EditorConfig::default(),
             hooks,
         }
     }
@@ -2141,7 +3010,7 @@ mod tests {
     }
 
     #[test]
-    fn common_prefix() {
+    fn common_prefix_plain() {
         assert_eq!(longest_common_prefix(&["echo", "ech", "echelon"]), "ech");
         assert_eq!(longest_common_prefix(&["abc"]), "abc");
         assert_eq!(longest_common_prefix(&["x", "y"]), "");
@@ -2377,6 +3246,190 @@ mod tests {
     }
 
     #[test]
+    fn key_specs_parse_readline_spellings() {
+        assert_eq!(parse_key_spec("\\C-f"), Some(Key::Ctrl('f')));
+        assert_eq!(parse_key_spec("\\C-F"), Some(Key::Ctrl('f')));
+        assert_eq!(parse_key_spec("\\C-?"), Some(Key::Backspace));
+        assert_eq!(parse_key_spec("\\C-_"), Some(Key::Ctrl('_')));
+        assert_eq!(parse_key_spec("\\M-f"), Some(Key::Alt('f')));
+        assert_eq!(parse_key_spec("\\ex"), Some(Key::Alt('x')));
+        assert_eq!(parse_key_spec("\\M-\\C-?"), Some(Key::AltBackspace));
+        assert_eq!(parse_key_spec("\\e[A"), Some(Key::Up));
+        assert_eq!(parse_key_spec("\\e[1;5C"), Some(Key::WordRight));
+        assert_eq!(parse_key_spec("\\e[3~"), Some(Key::Delete));
+        assert_eq!(parse_key_spec("\\eOH"), Some(Key::Home));
+        assert_eq!(parse_key_spec("\\e"), Some(Key::Esc));
+        assert_eq!(parse_key_spec("\\C-m"), Some(Key::Enter));
+        assert_eq!(parse_key_spec("\\t"), Some(Key::Tab));
+        assert_eq!(parse_key_spec("\\x09"), Some(Key::Tab));
+        assert_eq!(parse_key_spec("\\011"), Some(Key::Tab));
+        assert_eq!(parse_key_spec("a"), Some(Key::Char('a')));
+        assert_eq!(parse_key_spec("ü"), Some(Key::Char('ü')));
+        // Unparseable: empty, chords, unknown sequences, junk escapes.
+        assert_eq!(parse_key_spec(""), None);
+        assert_eq!(parse_key_spec("\\C-x\\C-e"), None);
+        assert_eq!(parse_key_spec("ab"), None);
+        assert_eq!(parse_key_spec("\\e[99~"), None);
+        assert_eq!(parse_key_spec("\\Z"), None);
+    }
+
+    #[test]
+    fn key_specs_round_trip_through_bindings_listing() {
+        for (key, _) in DEFAULT_BINDINGS {
+            assert_eq!(
+                parse_key_spec(&key_spec(key)).as_ref(),
+                Some(key),
+                "spec {:?} for {key:?} does not round-trip",
+                key_spec(key)
+            );
+        }
+    }
+
+    #[test]
+    fn bind_overrides_default_and_unbind_masks_it() {
+        let mut ed = Editor::new();
+        let lookup = |ed: &Editor, spec: &str| -> Option<EditorAction> {
+            ed.bindings().find(|(k, _)| k == spec).map(|(_, a)| a)
+        };
+        assert_eq!(lookup(&ed, "\\C-f"), Some(EditorAction::ForwardChar));
+
+        ed.bind("\\C-f", EditorAction::KillLine).unwrap();
+        assert_eq!(lookup(&ed, "\\C-f"), Some(EditorAction::KillLine));
+        // The default row is replaced, not duplicated.
+        assert_eq!(ed.bindings().filter(|(k, _)| k == "\\C-f").count(), 1);
+
+        ed.unbind("\\C-f").unwrap();
+        assert_eq!(lookup(&ed, "\\C-f"), None);
+
+        // Host bindings are stored but not listed as actions.
+        ed.bind_host("\\C-g", "fzf".to_string()).unwrap();
+        assert_eq!(lookup(&ed, "\\C-g"), None);
+        assert!(
+            ed.bindings
+                .iter()
+                .any(|(k, b)| *k == Key::Ctrl('g') && *b == Binding::Host("fzf".to_string()))
+        );
+
+        // A bad spec is an InvalidInput error.
+        let err = ed.bind("\\C-x\\C-e", EditorAction::Undo).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebound_key_runs_the_new_action() {
+        // C-f rebound to kill-line: dispatch consults the custom table.
+        let mut ed = Editor::new();
+        ed.bind("\\C-f", EditorAction::KillLine).unwrap();
+        let (key, binding) = &ed.bindings[0];
+        assert_eq!(*key, Key::Ctrl('f'));
+        let Binding::Action(action) = binding else {
+            panic!("expected an action binding");
+        };
+        let mut st = state("hello", 2);
+        let mut ring = Vec::new();
+        run_action(&mut st, *action, key, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "he");
+        assert_eq!(ring, ["llo"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn menu_complete_inserts_first_candidate_immediately() {
+        struct H;
+        impl Hooks for H {
+            fn complete(&self, line: &str, pos: usize) -> (usize, Vec<Candidate>) {
+                let cand = |s: &str| Candidate {
+                    display: s.to_string(),
+                    replacement: s.to_string(),
+                };
+                let _ = (line, pos);
+                (4, vec![cand("alpha"), cand("alphabet")])
+            }
+        }
+        let mut st = state_hooked("say al", 6, &H);
+        st.cfg.menu_complete = true;
+        let mut ring = Vec::new();
+        run_action(&mut st, EditorAction::Complete, &Key::Tab, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "say alpha");
+        run_action(&mut st, EditorAction::Complete, &Key::Tab, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "say alphabet");
+        run_action(&mut st, EditorAction::Complete, &Key::Tab, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "say alpha"); // wraps
+    }
+
+    #[test]
+    fn case_insensitive_common_prefix() {
+        assert_eq!(common_prefix(&["Echo", "echelon"], true), "Ech");
+        assert_eq!(common_prefix(&["Echo", "echelon"], false), "");
+        assert_eq!(common_prefix(&["abc", "ABC"], true), "abc");
+        assert_eq!(common_prefix(&["x", "y"], true), "");
+        assert_eq!(common_prefix(&[], true), "");
+    }
+
+    #[test]
+    fn history_timestamps_round_trip_both_formats() {
+        let path = std::env::temp_dir().join(format!("rusty_lines_ts_test_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Adding stamps entries; plain save leaves the file un-timestamped.
+        let mut ed = Editor::new();
+        ed.add_history_entry("one");
+        assert!(ed.history_timestamps()[0].is_some());
+        ed.save_history(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().starts_with('#'));
+
+        // Timestamped save writes bash's `#<epoch>` comment lines...
+        ed.set_history_timestamps(true);
+        ed.save_history(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with('#'), "no timestamp line:\n{text}");
+        assert!(text.ends_with("one\n"));
+
+        // ...which load back as timestamps, not entries, and append keeps
+        // stamping.
+        let mut ed2 = Editor::new();
+        ed2.set_history_timestamps(true);
+        ed2.load_history(&path).unwrap();
+        assert_eq!(ed2.history(), ["one"]);
+        assert_eq!(ed2.history_timestamps(), ed.history_timestamps());
+        ed2.add_history_entry("two");
+        ed2.append_history(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            4,
+            "expected 2 stamped entries:\n{text}"
+        );
+
+        // A plain (never-stamped) file loads with `None` timestamps.
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let mut ed3 = Editor::new();
+        ed3.load_history(&path).unwrap();
+        assert_eq!(ed3.history(), ["alpha", "beta"]);
+        assert_eq!(ed3.history_timestamps(), [None, None]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replace_history_swaps_entries_and_keeps_appends_incremental() {
+        let path =
+            std::env::temp_dir().join(format!("rusty_lines_replace_test_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut ed = Editor::new();
+        ed.add_history_entry("a");
+        ed.add_history_entry("b");
+        ed.replace_history(vec!["b".to_string()]); // history -d dropped "a"
+        assert_eq!(ed.history(), ["b"]);
+        assert_eq!(ed.history_timestamps(), [None]);
+        // Replaced entries count as persisted: only later additions append.
+        ed.add_history_entry("c");
+        ed.append_history(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "c\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn history_dedup_erases_earlier_duplicates() {
         let mut ed = Editor::new();
         ed.set_history_dedup(true);
@@ -2400,7 +3453,14 @@ mod tests {
         st.buffer = "helloxyz".to_string();
         st.cursor = 8;
         let mut ring = Vec::new();
-        handle_insert(&mut st, Key::Alt('r'), &[], &mut ring);
+        run_action(
+            &mut st,
+            EditorAction::RevertLine,
+            &Key::Alt('r'),
+            &[],
+            &mut ring,
+        )
+        .unwrap();
         assert_eq!(st.buffer, "hello");
         assert_eq!(st.cursor, 5);
         assert!(st.undo.is_empty());
@@ -2442,13 +3502,27 @@ mod tests {
 
         // At end of line: accept exactly one word of the hint.
         let mut st = state_hooked("he", 2, &H);
-        handle_insert(&mut st, Key::Alt('f'), &[], &mut ring);
+        run_action(
+            &mut st,
+            EditorAction::ForwardWord,
+            &Key::Alt('f'),
+            &[],
+            &mut ring,
+        )
+        .unwrap();
         assert_eq!(st.buffer, "hello");
         assert_eq!(st.cursor, 5);
 
         // Mid-line: plain word motion, no hint involvement.
         let mut st = state_hooked("he", 0, &H);
-        handle_insert(&mut st, Key::Alt('f'), &[], &mut ring);
+        run_action(
+            &mut st,
+            EditorAction::ForwardWord,
+            &Key::Alt('f'),
+            &[],
+            &mut ring,
+        )
+        .unwrap();
         assert_eq!(st.buffer, "he");
         assert_eq!(st.cursor, 2);
     }

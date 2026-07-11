@@ -291,6 +291,55 @@ fn alt_f_accepts_one_word_of_hint() {
 }
 
 #[test]
+fn rebound_key_runs_the_new_action() {
+    // hooked rebinds C-o to unix-line-discard: "abc" C-o "def" leaves
+    // only "def".
+    let out = run_session_in("hooked", "hooked> ", &[b"abc", b"\x0f", b"def", b"\r"]);
+    assert!(out.contains(&echo("def")), "rebinding ignored:\n{out}");
+    assert!(
+        !out.contains(&echo("abcdef")),
+        "rebound key did nothing:\n{out}"
+    );
+}
+
+#[test]
+fn host_binding_rewrites_the_line() {
+    // hooked binds C-g to a host command that uppercases the line
+    // (bash `bind -x`): the edited buffer must survive the raw-mode
+    // suspend/resume round trip.
+    let out = run_session_in("hooked", "hooked> ", &[b"abc", b"\x07", b"\r"]);
+    assert!(out.contains(&echo("ABC")), "host binding missing:\n{out}");
+}
+
+#[test]
+fn read_line_timeout_expires_at_the_prompt() {
+    // Sit at the timeout example's prompt without typing: the 2s deadline
+    // must fire, print bash's message, and exit cleanly.
+    let (master, mut child) = spawn_example("timeout");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    wait_for_prompt(&master, &mut out, deadline, "timeout> ");
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timeout demo did not exit:\n{}",
+            strip_ansi(&out)
+        );
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success(), "timeout demo exited with {status}");
+    drain(&master, &mut out, 200);
+    let out = strip_ansi(&out);
+    assert!(
+        out.contains("timed out waiting for input"),
+        "timeout message missing:\n{out}"
+    );
+}
+
+#[test]
 fn resize_while_idle_repaints_and_keeps_the_line() {
     // Type half a line, shrink the terminal while the editor idles at
     // the prompt (no keystroke pending), then finish the line: the idle

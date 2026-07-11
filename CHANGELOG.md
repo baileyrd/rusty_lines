@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+- Key rebinding API (revisiting a narrowing; rush's `bind` builtin):
+  the emacs/vi-insert commands are now the public `EditorAction` enum,
+  and `Editor::bind`/`unbind`/`bindings` remap single keys using
+  readline's key-spec spellings (`\C-x`, `\M-f`, `\e[1;5C`, backslash
+  escapes). `unbind` masks a default (readline `bind -r`); `bindings()`
+  lists the effective keymap (`bind -P`). Multi-key chords, vi normal
+  mode, and `.inputrc` parsing stay out of scope.
+- Host-command bindings — bash's `bind -x`: `Editor::bind_host` tags a
+  key; pressing it suspends raw mode and calls the new
+  `Hooks::host_binding(tag, &mut line, &mut cursor)`
+  (`READLINE_LINE`/`READLINE_POINT` contract), then repaints.
+- Readline variables: `set_completion_ignore_case`,
+  `set_show_all_if_ambiguous`, `set_menu_complete` (Tab becomes
+  readline's `menu-complete`), and `set_bell_style` (`BellStyle`;
+  audible by default like readline — the editor now rings on completion
+  with no candidates, so hosts wanting the old silence set
+  `BellStyle::None`).
+- Read deadline (bash `$TMOUT`): `Editor::read_line_timeout` and the
+  new `ReadResult::TimedOut` variant. The deadline is measured from the
+  call and checked on the idle poll tick and between keystrokes; hosts
+  matching on `ReadResult` exhaustively need a new arm.
+- History timestamps (bash `HISTTIMEFORMAT` file format): entries are
+  stamped on add; `load_history` parses `#<epoch>` comment lines (plain
+  files still load, both formats round-trip); `save_history`/
+  `append_history` emit them only under `set_history_timestamps(true)`,
+  so existing plain files are not rewritten unasked;
+  `history_timestamps()` exposes the stamps for the host's `history`
+  builtin.
+- In-place history replacement: `Editor::replace_history` resyncs the
+  editor's list after a host's `history -c`/`-d` without rebuilding the
+  editor (kill ring and session state survive); replaced entries count
+  as persisted, so `append_history` stays incremental.
+- Terminal facilities: public `terminal_size()` — (cols, rows) from
+  stdout, for `$COLUMNS`/`$LINES` (bash `checkwinsize`) — and
+  `with_echo_disabled(f)` — panic-safe echo-off around a closure, the
+  termios replacement for shelling out to `stty` in `read -s`.
+- New `examples/timeout.rs`; pty tests for the timeout, a rebound key,
+  and a host binding; `examples/hooked.rs` grew a rebinding and a host
+  binding to drive them.
+
 ## 0.2.0 — 2026-07-11
 
 - The terminal syscall surface (termios/poll/read/winsize) moved into

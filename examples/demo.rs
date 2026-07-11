@@ -18,7 +18,7 @@ fn main() -> std::io::Result<()> {
                 println!("{line}");
             }
             ReadResult::Interrupted => println!("^C"),
-            ReadResult::Eof => break,
+            ReadResult::Eof | ReadResult::TimedOut => break,
         }
     }
     Ok(())

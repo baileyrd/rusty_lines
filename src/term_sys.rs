@@ -107,14 +107,25 @@ mod imp {
 
     /// Terminal width in columns from stdout, if available and non-zero.
     pub fn term_cols_stdout() -> Option<usize> {
+        term_size_stdout().map(|(cols, _)| cols as usize)
+    }
+
+    /// Terminal size from stdout as (columns, rows), if available and
+    /// non-zero in both dimensions.
+    pub fn term_size_stdout() -> Option<(u16, u16)> {
         // SAFETY: `ws` is a valid, zeroed winsize the kernel fills.
         unsafe {
             let mut ws: libc::winsize = std::mem::zeroed();
-            if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-                return Some(ws.ws_col as usize);
+            if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                return Some((ws.ws_col, ws.ws_row));
             }
         }
         None
+    }
+
+    /// Turn terminal echo off in an attribute set (`stty -echo`'s bit).
+    pub fn clear_echo_flag(t: &mut Termios) {
+        t.c_lflag &= !libc::ECHO;
     }
 }
 
@@ -186,9 +197,20 @@ mod imp {
 
     /// Terminal width in columns from stdout, if available and non-zero.
     pub fn term_cols_stdout() -> Option<usize> {
+        term_size_stdout().map(|(cols, _)| cols as usize)
+    }
+
+    /// Terminal size from stdout as (columns, rows), if available and
+    /// non-zero in both dimensions.
+    pub fn term_size_stdout() -> Option<(u16, u16)> {
         match tty::window_size(1) {
-            Ok(ws) if ws.ws_col > 0 => Some(ws.ws_col as usize),
+            Ok(ws) if ws.ws_col > 0 && ws.ws_row > 0 => Some((ws.ws_col, ws.ws_row)),
             _ => None,
         }
+    }
+
+    /// Turn terminal echo off in an attribute set (`stty -echo`'s bit).
+    pub fn clear_echo_flag(t: &mut Termios) {
+        t.c_lflag &= !termios::ECHO;
     }
 }
