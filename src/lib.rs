@@ -725,10 +725,16 @@ impl Editor {
         {
             let _ = timeout;
             // No raw terminal on this platform: a plain buffered read
-            // with no editing — a documented narrowing.
+            // with no editing — a documented narrowing. Mirrors the Unix
+            // fallback (`read_line_plain`): a non-tty stdin doesn't get the
+            // prompt printed either, so a script piped into an
+            // "interactive" host doesn't get prompt text mixed into its
+            // captured output.
             let _ = (rprompt, hooks);
-            print!("{prompt}");
-            io::stdout().flush()?;
+            if std::io::IsTerminal::is_terminal(&io::stdin()) {
+                print!("{prompt}");
+                io::stdout().flush()?;
+            }
             let mut line = String::new();
             if io::stdin().read_line(&mut line)? == 0 {
                 return Ok(ReadResult::Eof);

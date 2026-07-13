@@ -41,6 +41,12 @@
 - New `examples/timeout.rs`; pty tests for the timeout, a rebound key,
   and a host binding; `examples/hooked.rs` grew a rebinding and a host
   binding to drive them.
+- Fix: the non-Unix `read_line_timeout` fallback printed the prompt
+  unconditionally, unlike the Unix path (which suppresses it for a
+  non-tty stdin, falling back to `read_line_plain`). A script piped into
+  an "interactive" host on Windows — rush's own `-i` test harness, for
+  one — got prompt text mixed into captured stdout. Now gated on
+  `IsTerminal::is_terminal`, matching the Unix behavior.
 
 ## 0.2.0 — 2026-07-11
 
