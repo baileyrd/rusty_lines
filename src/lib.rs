@@ -84,6 +84,7 @@ mod term_sys;
 
 /// One completion candidate: the text shown in the columned list, and the
 /// text inserted into the buffer.
+#[derive(Debug, Clone)]
 pub struct Candidate {
     /// The text shown in the candidate list.
     pub display: String,
@@ -471,6 +472,7 @@ impl Default for EditorConfig {
 }
 
 /// How a [`Editor::read_line`] call ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadResult {
     /// A complete line (Enter).
     Line(String),
@@ -529,6 +531,7 @@ pub fn with_echo_disabled<T>(f: impl FnOnce() -> T) -> io::Result<T> {
 
 /// The line editor: owns the history and the kill ring, both of which
 /// persist across [`read_line`](Editor::read_line) calls within a session.
+#[derive(Debug)]
 pub struct Editor {
     history: Vec<String>,
     /// Per-entry epoch timestamps, parallel to `history` (`None` for
@@ -908,22 +911,49 @@ impl Editor {
     /// it; a leading `#V2` header (the format `rustyline`'s `FileHistory`
     /// writes, for hosts migrating) is skipped. Files with and without
     /// timestamps both round-trip.
+    ///
+    /// A history *entry* can itself look like a timestamp comment —
+    /// interactive shells store comment lines, so a user who typed `#42`
+    /// has exactly that in the file. The loader keeps the recoverable
+    /// cases as entries: only epoch-scale stamps (nine or more digits)
+    /// count as timestamps, and a stamp with nothing after it is an
+    /// entry. A lone comment line that *is* an epoch-scale number
+    /// followed by another entry remains inherently ambiguous in bash's
+    /// format and is read as a timestamp.
     pub fn load_history(&mut self, path: &std::path::Path) -> io::Result<()> {
+        fn stamp_of(line: &str) -> Option<i64> {
+            let digits = line.strip_prefix('#')?;
+            if digits.len() >= 9 && digits.bytes().all(|b| b.is_ascii_digit()) {
+                digits.parse().ok()
+            } else {
+                None
+            }
+        }
         let text = std::fs::read_to_string(path)?;
-        let mut pending_ts: Option<i64> = None;
-        for (i, line) in text.lines().enumerate() {
+        let mut lines = text.lines().enumerate().peekable();
+        while let Some((i, line)) = lines.next() {
             if i == 0 && line == "#V2" {
                 continue;
             }
-            if let Some(digits) = line.strip_prefix('#')
-                && !digits.is_empty()
-                && digits.bytes().all(|b| b.is_ascii_digit())
-            {
-                pending_ts = digits.parse().ok();
+            if let Some(ts) = stamp_of(line) {
+                match lines.peek() {
+                    // The stamp applies to the next line — even one that
+                    // is itself stamp-shaped: the writer always pairs
+                    // stamp+entry, so an adjacent stamp-shaped line is a
+                    // `#<digits>` command being recalled.
+                    Some(&(_, next)) if !next.is_empty() => {
+                        let (_, entry) = lines.next().expect("peeked");
+                        self.add_entry(entry, Some(ts));
+                    }
+                    // Dangling at EOF (or before a blank): a stamp is
+                    // never written without its entry, so this was a
+                    // real `#<digits>` entry.
+                    _ => self.add_entry(line, None),
+                }
                 continue;
             }
             if !line.is_empty() {
-                self.add_entry(line, pending_ts.take());
+                self.add_entry(line, None);
             }
         }
         self.persisted = self.history.len();
@@ -1034,9 +1064,11 @@ impl Editor {
         {
             let deadline = timeout.map(|t| std::time::Instant::now() + t);
             // A non-tty stdin (a script piped into an "interactive"
-            // host) can't enter raw mode; fall back to a plain silent
-            // read, like readline does.
-            if !term_sys::isatty_stdin() {
+            // host) can't enter raw mode, and a non-tty stdout (the host
+            // piped into `tee`) has nothing to paint on — repaint escape
+            // sequences would just be sprayed into the pipe. Either way,
+            // fall back to a plain silent read, like readline does.
+            if !term_sys::isatty_stdin() || !term_sys::isatty_stdout() {
                 return read_line_plain(hooks, deadline);
             }
             read_line_raw(self, prompt, rprompt, hooks, deadline, initial)
@@ -1644,6 +1676,9 @@ fn read_key(hooks: &dyn Hooks) -> io::Result<Option<Key>> {
                     _ => Key::Other,
                 },
                 Some(0x7f) => Key::AltBackspace,
+                // ESC ESC: rapid double-Esc (a vi user mashing into
+                // normal mode) — both used to be swallowed as `Other`.
+                Some(0x1b) => Key::Esc,
                 Some(c) if c.is_ascii_graphic() => Key::Alt(c as char),
                 // A meta-prefixed multibyte character (Alt-ö, any
                 // non-ASCII layout): assemble the whole UTF-8 sequence —
@@ -1728,9 +1763,22 @@ fn display_width(s: &str) -> usize {
 /// cursor math never emit a raw control byte at the terminal.
 #[cfg(unix)]
 fn visualize(s: &str, start_col: usize) -> String {
+    visualize_marked(s, start_col, usize::MAX).0
+}
+
+/// [`visualize`], additionally reporting the display column at byte
+/// offset `mark` and at the end — so the render measures the whole
+/// buffer, the cursor position, and the paint in a single pass instead
+/// of visualizing the buffer twice and re-measuring the output.
+#[cfg(unix)]
+fn visualize_marked(s: &str, start_col: usize, mark: usize) -> (String, usize, usize) {
     let mut out = String::with_capacity(s.len());
     let mut col = start_col;
-    for c in s.chars() {
+    let mut mark_col = None;
+    for (i, c) in s.char_indices() {
+        if mark_col.is_none() && i >= mark {
+            mark_col = Some(col);
+        }
         // Tabs expand to the next 8-column stop of the running display
         // offset (`start_col` is where this text begins — the prompt
         // width for the buffer), so tab-indented content lines up the
@@ -1747,7 +1795,7 @@ fn visualize(s: &str, start_col: usize) -> String {
         push_vis_char(&mut out, c);
         col += display_width(&out[before..]);
     }
-    out
+    (out, mark_col.unwrap_or(col), col)
 }
 
 /// One character of [`visualize`]'s transform — everything except tabs,
@@ -2034,6 +2082,23 @@ fn read_line_raw(
                 break;
             }
             hooks.on_interrupted_read();
+            // Self-healing raw mode: an external SIGTSTP + `fg` (the
+            // parent shell restores *its* termios on continue), or a
+            // trap/host command that ran `stty`, leaves the terminal
+            // cooked — the editor would echo doubly and read
+            // line-buffered until the next read_line. readline
+            // re-prepares the terminal after SIGCONT; without a signal
+            // handler, the tick checks and re-asserts instead.
+            if let Ok(cur) = term_sys::tcgetattr_stdin()
+                && !term_sys::is_raw(&cur)
+            {
+                raw.resume();
+                st.painted_rows = 1;
+                st.painted_cursor_row = 0;
+                st.fresh_region = true;
+                println!();
+                render(&mut st, history)?;
+            }
             let now = term_cols();
             if now != cols {
                 cols = now;
@@ -4150,7 +4215,10 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
     // depend on it.
     let wp = display_width(mode) + display_width(prompt_line);
 
-    let vis = visualize(&st.buffer, wp);
+    // One pass over the buffer measures the paint, the cursor column,
+    // and the total width together.
+    let (vis, wcursor, vis_end) = visualize_marked(&st.buffer, wp, st.cursor);
+    let wb = vis_end - wp;
     // The host highlights the raw buffer (true text, true offsets); its
     // SGR markup survives and everything else is re-visualized. A buffer
     // holding a literal ESC is painted unhighlighted — hook markup and
@@ -4160,14 +4228,12 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
     } else {
         visualize_keep_sgr(&st.hooks.highlight(&st.buffer), wp)
     };
-    let wb = display_width(&vis);
     let hint = if st.cursor == st.buffer.len() {
         visualize(&cached_hint(st, history).unwrap_or_default(), wp + wb)
     } else {
         String::new()
     };
     let wh = display_width(&hint);
-    let wcursor = wp + display_width(&visualize(&st.buffer[..st.cursor], wp));
     let wtotal = wp + wb + wh;
 
     out.push_str(mode);
@@ -5405,6 +5471,130 @@ mod tests {
         assert!(key_completes(&Key::BackTab, &[], true));
         assert!(key_completes(&Key::Tab, &[], true));
         assert!(!key_completes(&Key::Char('x'), &[], true));
+    }
+
+    /// A tiny deterministic xorshift — the chaos tests below need
+    /// repeatable garbage, not real randomness.
+    fn xorshift(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    #[test]
+    fn decoders_survive_byte_soup() {
+        // The pure decoders and text helpers slice and do arithmetic on
+        // arbitrary input; hammer them with seeded garbage and require
+        // only that nothing panics. (Cheap always-on fuzzing — no
+        // cargo-fuzz dependency, per the crate's zero-dep ethos.)
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..2000u32 {
+            let len = (xorshift(&mut seed) % 12) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| (xorshift(&mut seed) & 0xff) as u8)
+                .collect();
+            let _ = decode_key_bytes(&bytes);
+            let _ = csi_key(
+                std::str::from_utf8(&bytes).unwrap_or(""),
+                (xorshift(&mut seed) & 0xff) as u8,
+            );
+            let s = String::from_utf8_lossy(&bytes).into_owned();
+            let _ = parse_key_spec(&s);
+            let _ = display_width(&s);
+            let _ = longest_common_prefix(&[&s, "probe"]);
+            let _ = contains_match(&s, "aB", true);
+            let _ = starts_with_match(&s, &s, true);
+            let _ = match_pos(&s, "aB", round % 2 == 0);
+            #[cfg(unix)]
+            {
+                let col = (xorshift(&mut seed) % 40) as usize;
+                let _ = visualize(&s, col);
+                let _ = visualize_keep_sgr(&s, col);
+            }
+            for i in (0..=s.len()).filter(|&i| s.is_char_boundary(i)) {
+                let _ = word_back(&s, i);
+                let _ = word_back_alnum(&s, i);
+                let _ = word_forward_alnum(&s, i);
+                let _ = vi_word_fwd(&s, i);
+                let _ = vi_word_back(&s, i);
+                let _ = vi_word_end(&s, i);
+                let _ = vi_match_bracket(&s, i);
+                let _ = vi_word_object(&s, i, true);
+                let _ = vi_word_object(&s, i, false);
+                #[cfg(unix)]
+                {
+                    let _ = vi_find_target(&s, i, 'f', 'x');
+                    let _ = vi_find_target(&s, i, 'T', 'x');
+                    let _ = clamp_start(&s, xorshift(&mut seed) as usize, i);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn history_entries_that_look_like_comments_round_trip() {
+        let path =
+            std::env::temp_dir().join(format!("rusty_lines_hash_test_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // Short `#digits` comment entries survive a plain round-trip
+        // (interactive shells store comment lines).
+        let mut ed = Editor::new();
+        ed.add_history_entry("#42");
+        ed.add_history_entry("echo hi");
+        ed.save_history(&path).unwrap();
+        let mut ed2 = Editor::new();
+        ed2.load_history(&path).unwrap();
+        assert_eq!(ed2.history(), ["#42", "echo hi"]);
+        // And through the timestamped format: the stamp pairs with the
+        // stamp-shaped entry instead of eating it.
+        let mut ed = Editor::new();
+        ed.set_history_timestamps(true);
+        ed.add_history_entry("#1234567890");
+        ed.add_history_entry("echo hi");
+        ed.save_history(&path).unwrap();
+        let mut ed3 = Editor::new();
+        ed3.load_history(&path).unwrap();
+        assert_eq!(ed3.history(), ["#1234567890", "echo hi"]);
+        // A dangling epoch-scale stamp at EOF is an entry, not a stamp.
+        std::fs::write(&path, "echo a\n#987654321\n").unwrap();
+        let mut ed4 = Editor::new();
+        ed4.load_history(&path).unwrap();
+        assert_eq!(ed4.history(), ["echo a", "#987654321"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn public_types_have_useful_derives() {
+        // ReadResult: comparable and printable, so hosts can assert on it.
+        assert_eq!(
+            ReadResult::Line("x".to_string()),
+            ReadResult::Line("x".to_string())
+        );
+        assert_ne!(ReadResult::Eof, ReadResult::Interrupted);
+        let cloned = ReadResult::TimedOut.clone();
+        assert!(format!("{cloned:?}").contains("TimedOut"));
+        // Candidate: clonable and printable.
+        let c = Candidate {
+            display: "d".to_string(),
+            replacement: "r".to_string(),
+        };
+        assert!(format!("{:?}", c.clone()).contains("replacement"));
+        // Editor: printable (host debug logs).
+        assert!(format!("{:?}", Editor::new()).contains("history"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn double_esc_decodes_as_escape() {
+        // The streaming decoder's pure twin can't express the timing
+        // path, but the spec parser shares the table for single ESC…
+        assert_eq!(parse_key_spec("\\e"), Some(Key::Esc));
+        // …and the raw-mode recipe checker matches what apply_raw_flags
+        // produces (the self-healing tick depends on this agreement).
+        let mut t = term_sys::tcgetattr_stdin().unwrap_or_else(|_| unsafe { std::mem::zeroed() });
+        term_sys::apply_raw_flags(&mut t);
+        assert!(term_sys::is_raw(&t));
     }
 
     #[cfg(unix)]

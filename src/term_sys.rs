@@ -48,6 +48,13 @@ mod imp {
         unsafe { libc::isatty(0) != 0 }
     }
 
+    /// Is stdout a terminal? The editor paints on stdout, so raw-mode
+    /// editing needs it to be one just as much as stdin.
+    pub fn isatty_stdout() -> bool {
+        // SAFETY: isatty takes an fd and touches no memory.
+        unsafe { libc::isatty(1) != 0 }
+    }
+
     /// Read stdin's terminal attributes.
     pub fn tcgetattr_stdin() -> io::Result<Termios> {
         // SAFETY: `t` is a valid, zeroed termios the kernel fills.
@@ -71,25 +78,47 @@ mod imp {
         Ok(())
     }
 
-    /// The editor's raw-mode recipe: no flow control or CR/NL mangling, no
-    /// canonical mode, echo, signals, or literal-next; output stays cooked so
-    /// ordinary `println!` still works. One byte at a time, no read timeout.
+    /// The editor's raw-mode recipe: no flow control or CR/NL mangling
+    /// (`IGNCR` too — with it set, the `\r` that Enter sends would be
+    /// discarded), no 7-bit stripping (`ISTRIP` would corrupt every
+    /// UTF-8 high byte), no canonical mode, echo, signals, or
+    /// literal-next; output stays cooked so ordinary `println!` still
+    /// works. One byte at a time, no read timeout.
     pub fn apply_raw_flags(t: &mut Termios) {
-        t.c_iflag &= !(libc::IXON | libc::ICRNL | libc::INLCR);
+        t.c_iflag &= !(libc::IXON | libc::ICRNL | libc::INLCR | libc::IGNCR | libc::ISTRIP);
         t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
         t.c_cc[libc::VMIN] = 1;
         t.c_cc[libc::VTIME] = 0;
     }
 
-    /// Is a byte ready on stdin within `ms` milliseconds?
+    /// Does an attribute set still match the raw-mode recipe? What the
+    /// idle tick checks to heal the terminal after an external
+    /// SIGTSTP/SIGCONT or a host command that ran `stty`.
+    pub fn is_raw(t: &Termios) -> bool {
+        t.c_iflag & (libc::IXON | libc::ICRNL | libc::INLCR | libc::IGNCR | libc::ISTRIP) == 0
+            && t.c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN) == 0
+    }
+
+    /// Is a byte ready on stdin within `ms` milliseconds? A signal
+    /// interrupting the poll retries it — EINTR must not read as "no
+    /// input", which upstream would misdecode as a lone ESC or a
+    /// timed-out escape sequence.
     pub fn poll_stdin(ms: i32) -> bool {
-        let mut pfd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: single valid pollfd, count 1.
-        unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
+        loop {
+            let mut pfd = libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: single valid pollfd, count 1.
+            let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if n >= 0 {
+                return n > 0;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return false;
+            }
+        }
     }
 
     /// Read one byte from stdin: `Ok(Some(b))`, `Ok(None)` at EOF, or an
@@ -153,6 +182,12 @@ mod imp {
         termios::isatty(0)
     }
 
+    /// Is stdout a terminal? The editor paints on stdout, so raw-mode
+    /// editing needs it to be one just as much as stdin.
+    pub fn isatty_stdout() -> bool {
+        termios::isatty(1)
+    }
+
     /// Read stdin's terminal attributes.
     pub fn tcgetattr_stdin() -> io::Result<Termios> {
         termios::tcgetattr(0).map_err(to_io)
@@ -165,23 +200,43 @@ mod imp {
     }
 
     /// The editor's raw-mode recipe (identical to the libc backend's, using
-    /// the same kernel flag bits). Deliberately lighter than
+    /// the same kernel flag bits — see that backend for the `IGNCR`/
+    /// `ISTRIP` rationale). Deliberately lighter than
     /// `Termios::make_raw`: output processing is left on.
     pub fn apply_raw_flags(t: &mut Termios) {
-        t.c_iflag &= !(termios::IXON | termios::ICRNL | termios::INLCR);
+        t.c_iflag &=
+            !(termios::IXON | termios::ICRNL | termios::INLCR | termios::IGNCR | termios::ISTRIP);
         t.c_lflag &= !(termios::ICANON | termios::ECHO | termios::ISIG | termios::IEXTEN);
         t.c_cc[termios::VMIN] = 1;
         t.c_cc[termios::VTIME] = 0;
     }
 
-    /// Is a byte ready on stdin within `ms` milliseconds?
+    /// Does an attribute set still match the raw-mode recipe? What the
+    /// idle tick checks to heal the terminal after an external
+    /// SIGTSTP/SIGCONT or a host command that ran `stty`.
+    pub fn is_raw(t: &Termios) -> bool {
+        t.c_iflag
+            & (termios::IXON | termios::ICRNL | termios::INLCR | termios::IGNCR | termios::ISTRIP)
+            == 0
+            && t.c_lflag & (termios::ICANON | termios::ECHO | termios::ISIG | termios::IEXTEN) == 0
+    }
+
+    /// Is a byte ready on stdin within `ms` milliseconds? A signal
+    /// interrupting the poll retries it — EINTR must not read as "no
+    /// input" (see the libc backend).
     pub fn poll_stdin(ms: i32) -> bool {
-        let mut fds = [fd::PollFd {
-            fd: 0,
-            events: fd::POLLIN,
-            revents: 0,
-        }];
-        matches!(fd::poll(&mut fds, ms), Ok(n) if n > 0)
+        loop {
+            let mut fds = [fd::PollFd {
+                fd: 0,
+                events: fd::POLLIN,
+                revents: 0,
+            }];
+            match fd::poll(&mut fds, ms) {
+                Ok(n) => return n > 0,
+                Err(e) if to_io(e).kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            }
+        }
     }
 
     /// Read one byte from stdin: `Ok(Some(b))`, `Ok(None)` at EOF, or an

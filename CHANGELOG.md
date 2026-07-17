@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+- Fix (raw-mode recipe): `ISTRIP` and `IGNCR` are now cleared on entry
+  to raw mode. If the inherited termios had `ISTRIP` set, every UTF-8
+  high byte lost its top bit (all non-ASCII input corrupted); with
+  `IGNCR` set, the `\r` that Enter sends was discarded — Enter was
+  dead. readline clears both.
+- Fix: `poll_stdin` treated EINTR (and any poll error) as "no input",
+  so a signal landing during the short polls misdecoded ESC as a lone
+  Esc, abandoned half-read escape sequences, and made bounded waits
+  give up early. Both backends now retry on EINTR.
+- Self-healing raw mode: the 200ms idle tick verifies the terminal
+  still matches the raw recipe and re-asserts it (plus a repaint on a
+  fresh line) when an external SIGTSTP/`fg` or a host command's `stty`
+  left the tty cooked — readline's SIGCONT re-preparation, without
+  installing a signal handler (which stays the host's business).
+- Raw editing now also requires *stdout* to be a terminal: with stdout
+  piped (`host | tee log`) the editor used to spray repaint escape
+  sequences into the pipe; it now falls back to the plain read, same
+  as for a piped stdin.
+- Fix: rapid double-Esc (a vi user mashing into normal mode) was
+  swallowed whole — ESC followed by ESC within the 30ms window decoded
+  to nothing. It now decodes as Esc.
+- History round-trip: entries that *look like* timestamp comments are
+  no longer eaten by `load_history`. Interactive shells store comment
+  lines, so `#42` is a legitimate entry; now only epoch-scale stamps
+  (nine or more digits) parse as timestamps, a stamp always pairs with
+  the following entry line (even a stamp-shaped one), and a dangling
+  stamp is kept as an entry. A lone epoch-scale comment followed by
+  another entry remains inherently ambiguous in bash's format
+  (documented on `load_history`).
+- CI: every job now builds `--locked`, so the committed `Cargo.lock`
+  is authoritative and a push to the `rusty_libc` git dependency's
+  tracked branch can no longer change or break CI builds silently.
+- Chaos tests: a seeded, deterministic byte-soup test hammers the pure
+  decoders and text helpers (`parse_key_spec`, `decode_key_bytes`,
+  `csi_key`, `visualize*`, `display_width`, the word/object/find
+  helpers, `clamp_start`) asserting nothing panics — always-on cheap
+  fuzzing with no cargo-fuzz dependency.
+- Render: the buffer is now visualized once per keystroke instead of
+  twice — a single marked pass measures the paint, the cursor column,
+  and the total width together (`visualize_marked`).
+- API polish: `ReadResult` derives `Debug`/`Clone`/`PartialEq`/`Eq`
+  (hosts can `assert_eq!` on it), `Candidate` derives `Debug`/`Clone`,
+  and `Editor` derives `Debug`.
 - Pre-seeded lines: `Editor::read_line_with_initial(prompt, rprompt,
   hooks, (left, right))` starts the edit with text in the buffer and
   the cursor between the halves (rustyline's `readline_with_initial`,

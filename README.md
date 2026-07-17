@@ -65,7 +65,7 @@ full per-editor survey behind this table is in
 | History cap: `set_max_history_len` drops oldest past the limit | readline `stifle_history`, bash `HISTSIZE` |
 | History dedup option: `set_history_dedup` erases earlier duplicates | bash `HISTCONTROL=erasedups`, fish |
 | History ignore-space option: `set_history_ignore_space` skips lines starting with a space | bash `HISTCONTROL=ignorespace`, zsh `HIST_IGNORE_SPACE` |
-| History persistence: `save_history` rewrites atomically (temp file + rename) and creates the file mode 0600, `append_history` appends only new entries; `load_history` tolerates a rustyline `#V2` header | bash `histappend` and its 0600 history file; rustyline migration |
+| History persistence: `save_history` rewrites atomically (temp file + rename) and creates the file mode 0600, `append_history` appends only new entries; `load_history` tolerates a rustyline `#V2` header, and `#<digits>` *comment entries* round-trip (only epoch-scale, paired stamps parse as timestamps) | bash `histappend` and its 0600 history file; rustyline migration |
 | Clear screen: C-l clears and repaints the edit region at the top | readline `clear-screen` |
 | Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search; starts from the current history position after an unedited recall; a paste types into the query; a miss shows `(failed reverse-i-search)` and rings the bell, keeping the last match visible; leaving the search puts the cursor *on* the match (readline's point) | readline, ZLE (bash paste-into-query) |
 | Case-insensitive search option: `set_search_ignore_case` covers incremental *and* prefix search | readline 8.1 `search-ignore-case` |
@@ -85,7 +85,7 @@ full per-editor survey behind this table is in
 | Wide chars + UTF-8 input assembly (including Alt + non-ASCII chords, `\M-ö`); ANSI-aware width math (CSI *and* OSC — a hyperlinked or titled prompt measures correctly); soft-wrap repaint without flicker (paint-then-clear); `^X` control-char visualization keeps cursor math exact; tabs render at 8-column stops of the true display offset | all modern |
 | Multi-line prompts (`PS1` with newlines): the lines before the last paint once per region; only the final line is the repainted edit row | readline, zsh |
 | Robust escape decoding: unrecognized CSI sequences (SGR mouse reports, private modes) are consumed whole per ECMA-48 instead of leaking their tail into the buffer as typed text | readline, all modern |
-| Resize: width re-read on every repaint; a resize while idle at the prompt repaints within a poll tick (~200ms) | readline SIGWINCH, approximated without signals |
+| Resize: width re-read on every repaint; a resize while idle at the prompt repaints within a poll tick (~200ms); the same tick re-asserts raw mode if an external SIGTSTP/`fg` or a host command's `stty` left the terminal cooked | readline SIGWINCH + SIGCONT re-preparation, approximated without signals |
 | Key rebinding: `bind`/`unbind` accept readline key-spec spellings (`\C-x`, `\M-f`, `\e[1;5C`), remapping single keys to named `EditorAction`s; `bindings()` lists the effective keymap; `EditorAction::name`/`from_name` map actions to readline's command names so hosts don't keep their own table | readline `bind '"\C-x": kill-line'`, `bind -P`, `bind -r`, `rl_named_function` |
 | Host-command bindings: `bind_host` + `Hooks::host_binding` — raw mode suspends, the host runs its command against the line/cursor, the edit resumes; `host_bindings()` lists them | bash `bind -x`, `bind -X` (`READLINE_LINE`/`READLINE_POINT`) |
 | Readline variables: `set_completion_ignore_case`, `set_show_all_if_ambiguous`, `set_menu_complete`, `set_bell_style` | readline `set completion-ignore-case on` … |
@@ -129,8 +129,9 @@ either niche, terminal-hostile, or a different program's job:
   sequences). Width is per-`char` via `unicode-width`; getting clusters
   right would add a segmentation dependency while terminals themselves
   disagree on cluster widths, so the common-case behavior is kept.
-- **Non-tty / non-Unix**: piped stdin gets a plain line read; non-Unix
-  builds get a buffered prompt-and-read.
+- **Non-tty / non-Unix**: a piped stdin *or* stdout gets a plain line
+  read (there is nothing to repaint on a pipe); non-Unix builds get a
+  buffered prompt-and-read.
 
 ## Verification
 
