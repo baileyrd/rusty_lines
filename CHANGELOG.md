@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+## 0.3.0 — 2026-07-17
+
+- Fix: EOF on stdin with text pending returned `Eof` and discarded the
+  line in the raw path; it now returns the line (readline's rule, and
+  what the piped-stdin path already did) — only an empty line is
+  end-of-input.
+- Fix: the output path used `print!`/`println!`, which panic on write
+  failure — a terminal vanishing mid-session (ssh drop, closed
+  emulator) killed the host with "failed printing to stdout" instead
+  of surfacing an `io::Error` like the read side. The whole paint path
+  is now fallible; the RAII guards, which cannot propagate, ignore
+  write errors.
+- The plain fallback prints the prompt to *stderr* when stdin is a
+  terminal (bash's rule): with stdout piped (`host | tee`), the
+  interactive user got no prompt at all after the stdout-tty gate.
+- Undo now coalesces runs of single-character deletes (Backspace /
+  Delete) exactly like insert runs, sharing the 20-character cap —
+  undoing a long rubout was one undo per character (readline groups
+  both).
+- Incremental-search Backspace is position-disciplined like typed
+  characters: shrinking the query re-searches at-or-before the current
+  hit instead of teleporting to the newest match.
+- `load_history` under `erasedups` is now O(n): one backward pass with
+  a hash set (last occurrence wins — provably what sequential adds
+  produce) replaces the per-line linear scan, which made loading a
+  large history file quadratic.
+- End-to-end coverage for the right-side prompt: new
+  `examples/rprompt.rs` and a pty test asserting the rprompt paints
+  and hides once the line grows into it (the zsh behavior the matrix
+  advertises).
+- Key-spec property test: every key the decoder can produce (a sweep
+  of all single bytes, ESC pairs, and CSI/SS3 finals) round-trips
+  through `key_spec` → `parse_key_spec`; `common_prefix` joined the
+  byte-soup chaos loop.
+- API polish: `EditorAction` implements `Display` (the readline
+  command name, so `bind -P`-style output is `format!("{action}")`)
+  and `NoHooks` derives `Debug`/`Clone`/`Copy`/`Default`.
+- Release housekeeping: version 0.3.0 cut per `docs/RELEASING.md` —
+  this section collects everything merged since 0.2.0 (the review
+  passes #16–#21), including the `Hooks::highlight` contract change
+  noted below. Minor-version bump per the pre-1.0 breaking-change
+  rule. MSRV unchanged at 1.88.
+
 - Fix (raw-mode recipe): `ISTRIP` and `IGNCR` are now cleared on entry
   to raw mode. If the inherited termios had `ISTRIP` set, every UTF-8
   high byte lost its top bit (all non-ASCII input corrupted); with

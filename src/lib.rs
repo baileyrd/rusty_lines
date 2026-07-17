@@ -148,6 +148,7 @@ pub trait Hooks {
 
 /// A no-op `Hooks`: plain editing with no completion, hints,
 /// highlighting, or abbreviations.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct NoHooks;
 impl Hooks for NoHooks {}
 
@@ -408,6 +409,14 @@ impl EditorAction {
     }
 }
 
+/// Formats as the readline command name ([`name`](EditorAction::name)),
+/// so `bind -P`-style listings are just `format!("{action}")`.
+impl std::fmt::Display for EditorAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// What ringing the terminal bell does — readline's `bell-style`
 /// variable, set via [`Editor::set_bell_style`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -567,15 +576,24 @@ pub struct Editor {
     cfg: EditorConfig,
 }
 
-/// The piped-stdin path: one line, no prompt, no editing. A deadline, if
-/// set, is honored between bytes via `poll`; a signal interrupting the
-/// read fires [`Hooks::on_interrupted_read`] like the raw path does, so
-/// a host running a piped script still gets its trap callback.
+/// The piped-stdin path: one line, no editing. A deadline, if set, is
+/// honored between bytes via `poll`; a signal interrupting the read
+/// fires [`Hooks::on_interrupted_read`] like the raw path does, so a
+/// host running a piped script still gets its trap callback. When stdin
+/// *is* a terminal (this path was taken because stdout is piped), the
+/// prompt goes to stderr — bash's rule — so the interactive user still
+/// sees where to type.
 #[cfg(unix)]
 fn read_line_plain(
+    prompt: &str,
     hooks: &dyn Hooks,
     deadline: Option<std::time::Instant>,
 ) -> io::Result<ReadResult> {
+    if term_sys::isatty_stdin() && !prompt.is_empty() {
+        let mut err = io::stderr().lock();
+        err.write_all(prompt.as_bytes())?;
+        err.flush()?;
+    }
     let mut line = Vec::new();
     let mut b = [0u8; 1];
     loop {
@@ -930,6 +948,7 @@ impl Editor {
             }
         }
         let text = std::fs::read_to_string(path)?;
+        let mut parsed: Vec<(&str, Option<i64>)> = Vec::new();
         let mut lines = text.lines().enumerate().peekable();
         while let Some((i, line)) = lines.next() {
             if i == 0 && line == "#V2" {
@@ -943,17 +962,46 @@ impl Editor {
                     // `#<digits>` command being recalled.
                     Some(&(_, next)) if !next.is_empty() => {
                         let (_, entry) = lines.next().expect("peeked");
-                        self.add_entry(entry, Some(ts));
+                        parsed.push((entry, Some(ts)));
                     }
                     // Dangling at EOF (or before a blank): a stamp is
                     // never written without its entry, so this was a
                     // real `#<digits>` entry.
-                    _ => self.add_entry(line, None),
+                    _ => parsed.push((line, None)),
                 }
                 continue;
             }
             if !line.is_empty() {
-                self.add_entry(line, None);
+                parsed.push((line, None));
+            }
+        }
+        if self.dedup {
+            // erasedups over the whole load in one backward pass (the
+            // last occurrence wins — exactly what sequential adds
+            // produce), instead of `add_entry`'s linear scan per line,
+            // which made loading a large file O(n²).
+            let mut combined: Vec<(String, Option<i64>)> = std::mem::take(&mut self.history)
+                .into_iter()
+                .zip(std::mem::take(&mut self.timestamps))
+                .collect();
+            combined.extend(parsed.into_iter().map(|(e, ts)| (e.to_string(), ts)));
+            let mut keep: Vec<bool> = vec![false; combined.len()];
+            {
+                let mut seen = std::collections::HashSet::new();
+                for (i, (entry, _)) in combined.iter().enumerate().rev() {
+                    keep[i] = seen.insert(entry.as_str());
+                }
+            }
+            for (kept, (entry, ts)) in keep.into_iter().zip(combined) {
+                if kept {
+                    self.history.push(entry);
+                    self.timestamps.push(ts);
+                }
+            }
+            self.trim_history();
+        } else {
+            for (entry, ts) in parsed {
+                self.add_entry(entry, ts);
             }
         }
         self.persisted = self.history.len();
@@ -1069,7 +1117,7 @@ impl Editor {
             // sequences would just be sprayed into the pipe. Either way,
             // fall back to a plain silent read, like readline does.
             if !term_sys::isatty_stdin() || !term_sys::isatty_stdout() {
-                return read_line_plain(hooks, deadline);
+                return read_line_plain(prompt, hooks, deadline);
             }
             read_line_raw(self, prompt, rprompt, hooks, deadline, initial)
         }
@@ -1084,7 +1132,7 @@ impl Editor {
             // captured output.
             let _ = (rprompt, hooks);
             if std::io::IsTerminal::is_terminal(&io::stdin()) {
-                print!("{prompt}");
+                write!(io::stdout(), "{prompt}")?;
                 io::stdout().flush()?;
             }
             let mut line = String::new();
@@ -1209,7 +1257,9 @@ struct BracketedPaste;
 #[cfg(unix)]
 impl BracketedPaste {
     fn enable() -> BracketedPaste {
-        print!("\x1b[?2004h");
+        // A guard constructor can't propagate a write error; a dead
+        // terminal will surface from the next fallible paint instead.
+        let _ = write!(io::stdout(), "\x1b[?2004h");
         let _ = io::stdout().flush();
         BracketedPaste
     }
@@ -1218,7 +1268,7 @@ impl BracketedPaste {
 #[cfg(unix)]
 impl Drop for BracketedPaste {
     fn drop(&mut self) {
-        print!("\x1b[?2004l");
+        let _ = write!(io::stdout(), "\x1b[?2004l");
         let _ = io::stdout().flush();
     }
 }
@@ -1873,6 +1923,9 @@ fn visualize_keep_sgr(s: &str, start_col: usize) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Insert,
+    /// A single-character delete (Backspace/Delete) — runs coalesce in
+    /// the undo history like insert runs do.
+    Delete,
     KillFwd,
     KillBack,
     Yank,
@@ -1926,9 +1979,9 @@ struct LineState<'a> {
     undo: VecDeque<(String, usize)>,
     prev_action: Action,
     this_action: Action,
-    /// Length of the current coalesced self-insert undo group (capped at
-    /// 20, readline's chunk size).
-    insert_run: usize,
+    /// Length of the current coalesced self-insert (or single-delete)
+    /// undo group (capped at 20, readline's chunk size).
+    edit_run: usize,
     /// Last yank's span and ring index, for M-y yank-pop.
     yank: Option<(usize, usize, usize)>,
     /// Last M-. insertion: (history index, span start, span end).
@@ -2037,7 +2090,7 @@ fn read_line_raw(
         undo: VecDeque::new(),
         prev_action: Action::Other,
         this_action: Action::Other,
-        insert_run: 0,
+        edit_run: 0,
         yank: None,
         lastarg: None,
         menu: None,
@@ -2096,7 +2149,7 @@ fn read_line_raw(
                 st.painted_rows = 1;
                 st.painted_cursor_row = 0;
                 st.fresh_region = true;
-                println!();
+                writeln!(io::stdout())?;
                 render(&mut st, history)?;
             }
             let now = term_cols();
@@ -2107,9 +2160,16 @@ fn read_line_raw(
         }
 
         let Some(key) = read_key(hooks)? else {
-            // EOF on stdin itself.
+            // EOF on stdin itself. With text pending, the line is
+            // returned rather than discarded — readline's rule, and what
+            // the piped-stdin path already does; only an empty line is
+            // end-of-input.
             finish_line(&mut st)?;
-            return Ok(ReadResult::Eof);
+            return Ok(if st.buffer.is_empty() {
+                ReadResult::Eof
+            } else {
+                ReadResult::Line(st.buffer)
+            });
         };
 
         // Ctrl-R/Ctrl-S search intercepts everything while active.
@@ -2152,7 +2212,7 @@ fn read_line_raw(
                     AfterKey::Done
                 }
                 Key::Ctrl('l') => {
-                    clear_screen(&mut st);
+                    clear_screen(&mut st)?;
                     AfterKey::Done
                 }
                 Key::Ctrl('_') | Key::Ctrl('z') => {
@@ -2262,24 +2322,26 @@ fn read_line_raw(
 }
 
 /// Post-key undo bookkeeping: snapshot any mutation, coalescing runs of
-/// plain self-insert in groups of at most 20 characters — readline's
-/// chunking, so one undo doesn't wipe an entire typed line.
+/// plain self-insert — and runs of single-character deletes — in groups
+/// of at most 20 characters, readline's chunking: one undo neither wipes
+/// an entire typed line nor replays a long rubout one character at a
+/// time.
 #[cfg(unix)]
 fn record_undo(st: &mut LineState, snapshot: (String, usize)) {
     if st.buffer == snapshot.0 || st.this_action == Action::Undo {
         return;
     }
-    let coalesce =
-        st.this_action == Action::Insert && st.prev_action == Action::Insert && st.insert_run < 20;
+    let groupable = matches!(st.this_action, Action::Insert | Action::Delete);
+    let coalesce = groupable && st.this_action == st.prev_action && st.edit_run < 20;
     if !coalesce {
         st.undo.push_back(snapshot);
         while st.undo.len() > st.cfg.max_undo {
             st.undo.pop_front();
         }
     }
-    st.insert_run = match (st.this_action, coalesce) {
-        (Action::Insert, true) => st.insert_run + 1,
-        (Action::Insert, false) => 1,
+    st.edit_run = match (groupable, coalesce) {
+        (true, true) => st.edit_run + 1,
+        (true, false) => 1,
         _ => 0,
     };
 }
@@ -2289,11 +2351,12 @@ fn record_undo(st: &mut LineState, snapshot: (String, usize)) {
 #[cfg(unix)]
 fn finish_line(st: &mut LineState) -> io::Result<()> {
     let down = st.painted_rows.saturating_sub(1 + st.painted_cursor_row);
+    let mut out = io::stdout().lock();
     if down > 0 {
-        print!("\x1b[{down}B");
+        write!(out, "\x1b[{down}B")?;
     }
-    println!();
-    io::stdout().flush()
+    writeln!(out)?;
+    out.flush()
 }
 
 /// Whether a key resolves to a completion action — the one case that
@@ -2364,11 +2427,12 @@ fn start_search(st: &mut LineState, history: &[String], forward: bool) {
 
 /// C-l: clear the screen; the next render repaints at the top.
 #[cfg(unix)]
-fn clear_screen(st: &mut LineState) {
-    print!("\x1b[2J\x1b[H");
+fn clear_screen(st: &mut LineState) -> io::Result<()> {
+    write!(io::stdout(), "\x1b[2J\x1b[H")?;
     st.painted_rows = 1;
     st.painted_cursor_row = 0;
     st.fresh_region = true;
+    Ok(())
 }
 
 /// Wait for the next byte, honoring the `read_line_timeout` deadline and
@@ -2412,17 +2476,17 @@ fn ctrl_x_chord(st: &mut LineState) -> io::Result<AfterKey> {
 fn bell(style: BellStyle) -> io::Result<()> {
     match style {
         BellStyle::None => return Ok(()),
-        BellStyle::Audible => print!("\x07"),
+        BellStyle::Audible => write!(io::stdout(), "\x07")?,
         // Reverse-video flip — the flash without terminfo's `flash`.
         BellStyle::Visible => {
             // Hold the reverse-video flash long enough to actually
             // render (terminfo's `flash` pauses too — set-then-unset in
             // one write can show zero frames). The poll keeps input
             // responsive: a keystroke just ends the flash early.
-            print!("\x1b[?5h");
+            write!(io::stdout(), "\x1b[?5h")?;
             io::stdout().flush()?;
             let _ = input_ready(80);
-            print!("\x1b[?5l");
+            write!(io::stdout(), "\x1b[?5l")?;
         }
     }
     io::stdout().flush()
@@ -2487,11 +2551,13 @@ fn run_action(
             if let Some(prev) = prev_char_start(&st.buffer, st.cursor) {
                 st.buffer.replace_range(prev..st.cursor, "");
                 st.cursor = prev;
+                st.this_action = Action::Delete;
             }
         }
         EditorAction::DeleteChar | EditorAction::DeleteCharOrEof => {
             if let Some(next) = next_char_end(&st.buffer, st.cursor) {
                 st.buffer.replace_range(st.cursor..next, "");
+                st.this_action = Action::Delete;
             }
         }
         EditorAction::BackwardChar => {
@@ -2593,7 +2659,7 @@ fn run_action(
         EditorAction::HistorySearchForward => history_prefix_next(st, history),
         EditorAction::ReverseSearchHistory => start_search(st, history, false),
         EditorAction::ForwardSearchHistory => start_search(st, history, true),
-        EditorAction::ClearScreen => clear_screen(st),
+        EditorAction::ClearScreen => clear_screen(st)?,
         EditorAction::Complete => {
             if st.menu.is_some() {
                 menu_next(st);
@@ -3077,7 +3143,11 @@ fn handle_search_key(
         }
         Key::Backspace => {
             search.query.pop();
-            search.hit = find_match(history, &search.query, history.len(), ci);
+            // Stay position-disciplined like the Char arm: re-search
+            // at-or-before the current hit instead of teleporting to
+            // the newest match when the query shrinks.
+            let limit = search.hit.map(|h| h + 1).unwrap_or(history.len());
+            search.hit = find_match(history, &search.query, limit, ci);
             search.failed = search.hit.is_none() && !search.query.is_empty();
         }
         Key::Char(c) => {
@@ -3978,29 +4048,33 @@ fn list_candidates(st: &mut LineState, candidates: &[Candidate]) -> io::Result<b
     st.fresh_region = true;
     // readline's completion-query-items: a big list asks first.
     if st.cfg.completion_query_items > 0 && candidates.len() >= st.cfg.completion_query_items {
-        print!("Display all {} possibilities? (y or n)", candidates.len());
+        write!(
+            io::stdout(),
+            "Display all {} possibilities? (y or n)",
+            candidates.len()
+        )?;
         io::stdout().flush()?;
         if !wait_for_key(st)? {
-            println!();
+            writeln!(io::stdout())?;
             return Ok(false); // deadline: the main loop times out
         }
         let yes = matches!(
             read_key(st.hooks)?,
             Some(Key::Char('y' | 'Y' | ' ')) | Some(Key::Tab)
         );
-        println!();
+        writeln!(io::stdout())?;
         if !yes {
             return Ok(false);
         }
     }
-    print_candidate_columns(candidates);
+    print_candidate_columns(candidates)?;
     Ok(true)
 }
 
 /// Print the candidate list in vertical (column-major) order, the way
 /// readline lays out its completion listing.
 #[cfg(unix)]
-fn print_candidate_columns(candidates: &[Candidate]) {
+fn print_candidate_columns(candidates: &[Candidate]) -> io::Result<()> {
     let width = candidates
         .iter()
         .map(|c| display_width(&c.display))
@@ -4018,8 +4092,9 @@ fn print_candidate_columns(candidates: &[Candidate]) {
                 line.extend(std::iter::repeat_n(' ', pad));
             }
         }
-        println!("{}", line.trim_end());
+        writeln!(io::stdout(), "{}", line.trim_end())?;
     }
+    Ok(())
 }
 
 /// readline `menu-complete` (also Tab under `set_menu_complete`): insert
@@ -4181,8 +4256,9 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
         let w = display_width(&line);
         st.painted_rows = w / cols + 1;
         st.painted_cursor_row = w / cols;
-        print!("{out}");
-        return io::stdout().flush();
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(out.as_bytes())?;
+        return stdout.flush();
     }
 
     // A multi-line prompt: everything up to the last newline is printed
@@ -4278,8 +4354,9 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
     st.painted_rows = total_rows;
     st.painted_cursor_row = cursor_row;
 
-    print!("{out}");
-    io::stdout().flush()
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(out.as_bytes())?;
+    stdout.flush()
 }
 
 #[cfg(test)]
@@ -4316,7 +4393,7 @@ mod tests {
             undo: VecDeque::new(),
             prev_action: Action::Other,
             this_action: Action::Other,
-            insert_run: 0,
+            edit_run: 0,
             yank: None,
             lastarg: None,
             menu: None,
@@ -5503,6 +5580,7 @@ mod tests {
             let _ = parse_key_spec(&s);
             let _ = display_width(&s);
             let _ = longest_common_prefix(&[&s, "probe"]);
+            let _ = common_prefix(&[&s, "aB"], true);
             let _ = contains_match(&s, "aB", true);
             let _ = starts_with_match(&s, &s, true);
             let _ = match_pos(&s, "aB", round % 2 == 0);
@@ -5595,6 +5673,116 @@ mod tests {
         let mut t = term_sys::tcgetattr_stdin().unwrap_or_else(|_| unsafe { std::mem::zeroed() });
         term_sys::apply_raw_flags(&mut t);
         assert!(term_sys::is_raw(&t));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_coalesces_delete_runs_like_insert_runs() {
+        // Type 5 chars, then rub them all out one Backspace at a time:
+        // the deletions must undo as one group, not five.
+        let mut st = state("", 0);
+        let mut ring = VecDeque::new();
+        for _ in 0..5 {
+            let snapshot = (st.buffer.clone(), st.cursor);
+            insert_char(&mut st, 'a');
+            st.this_action = Action::Insert;
+            record_undo(&mut st, snapshot);
+            st.prev_action = st.this_action;
+        }
+        for _ in 0..5 {
+            let snapshot = (st.buffer.clone(), st.cursor);
+            st.this_action = Action::Other;
+            run_action(
+                &mut st,
+                EditorAction::BackwardDeleteChar,
+                &Key::Backspace,
+                &[],
+                &mut ring,
+            )
+            .unwrap();
+            record_undo(&mut st, snapshot);
+            st.prev_action = st.this_action;
+        }
+        assert_eq!(st.buffer, "");
+        // One insert group + one delete group.
+        assert_eq!(st.undo.len(), 2);
+        undo_cmd(&mut st);
+        assert_eq!(st.buffer, "aaaaa", "one undo restores the whole rubout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_backspace_stays_position_disciplined() {
+        let history = vec!["git alpha".to_string(), "git beta".to_string()];
+        let mut st = state("git alpha", 9);
+        st.cfg.bell = BellStyle::None;
+        st.hist_index = Some(0);
+        start_search(&mut st, &history, false);
+        handle_search_key(&mut st, Key::Char('g'), &history).unwrap();
+        handle_search_key(&mut st, Key::Char('i'), &history).unwrap();
+        assert_eq!(st.search.as_ref().unwrap().hit, Some(0));
+        // Shrinking the query must not teleport the hit to the newest
+        // match; it re-searches at-or-before the current position.
+        handle_search_key(&mut st, Key::Backspace, &history).unwrap();
+        assert_eq!(st.search.as_ref().unwrap().hit, Some(0));
+    }
+
+    #[test]
+    fn dedup_load_matches_sequential_semantics_and_scales() {
+        let path =
+            std::env::temp_dir().join(format!("rusty_lines_dedup_load_{}", std::process::id()));
+        std::fs::write(&path, "a\nb\na\nc\nb\na\n").unwrap();
+        // Batch dedup load == what sequential erasedups adds produce.
+        let mut ed = Editor::new();
+        ed.set_history_dedup(true);
+        ed.add_history_entry("c");
+        ed.add_history_entry("x");
+        ed.load_history(&path).unwrap();
+        assert_eq!(ed.history(), ["x", "c", "b", "a"]);
+        // And a large file loads without the quadratic scan (smoke: this
+        // finishes instantly at O(n); the old path did ~10^8 compares).
+        let big: String = (0..20_000).map(|i| format!("cmd {}\n", i % 500)).collect();
+        std::fs::write(&path, big).unwrap();
+        let mut ed = Editor::new();
+        ed.set_history_dedup(true);
+        ed.load_history(&path).unwrap();
+        assert_eq!(ed.history().len(), 500);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn every_decodable_key_round_trips_through_its_spec() {
+        // The property behind the hand-picked spec tests: any key the
+        // decoder can produce has a spec that parses back to itself.
+        let mut keys = Vec::new();
+        for b in 0..=255u8 {
+            keys.extend(decode_key_bytes(&[b]));
+            keys.extend(decode_key_bytes(&[0x1b, b]));
+            keys.extend(decode_key_bytes(&[0x1b, b'[', b]));
+            keys.extend(decode_key_bytes(&[0x1b, b'O', b]));
+        }
+        assert!(keys.len() > 200, "decoder sweep looks broken");
+        for key in keys {
+            assert_eq!(
+                parse_key_spec(&key_spec(&key)).as_ref(),
+                Some(&key),
+                "spec {:?} for {key:?} does not round-trip",
+                key_spec(&key)
+            );
+        }
+    }
+
+    #[test]
+    fn action_display_is_the_readline_name() {
+        assert_eq!(format!("{}", EditorAction::KillLine), "kill-line");
+        assert_eq!(
+            EditorAction::MenuCompleteBackward.to_string(),
+            "menu-complete-backward"
+        );
+        // NoHooks is embeddable: Debug + Clone + Copy + Default.
+        let h: NoHooks = Default::default();
+        let _copy = h;
+        assert_eq!(format!("{h:?}"), "NoHooks");
     }
 
     #[cfg(unix)]
