@@ -267,6 +267,20 @@ pub enum EditorAction {
     /// Cycle the completion candidates backward — starting from the last
     /// (`menu-complete-backward`, Shift-Tab; zsh `reverse-menu-complete`).
     MenuCompleteBackward,
+    /// List the completion candidates without changing the buffer
+    /// (`possible-completions`, M-?).
+    PossibleCompletions,
+    /// Insert every completion candidate, space-separated
+    /// (`insert-completions`, M-*).
+    InsertCompletions,
+    /// Read one character and move the cursor to its next occurrence
+    /// (`character-search`, C-]).
+    CharacterSearch,
+    /// Read one character and move the cursor back to its previous
+    /// occurrence (`character-search-backward`; unbound — its readline
+    /// default M-C-] isn't a decodable chord here, but `bind` can place
+    /// it anywhere).
+    CharacterSearchBackward,
     /// Insert the next key literally (`quoted-insert`, C-v/C-q).
     QuotedInsert,
     /// Edit the line in `$VISUAL`/`$EDITOR` and execute the result
@@ -310,6 +324,9 @@ struct EditorConfig {
     /// Candidate count at/past which the list prompts "Display all N
     /// possibilities?" first (readline `completion-query-items`; 0 = never).
     completion_query_items: usize,
+    /// Appended after a unique, fully-inserted completion
+    /// (readline's `rl_completion_append_character`; `None` = nothing).
+    completion_append: Option<char>,
     /// Kill-ring depth (readline keeps 10 by default; 32 here, the
     /// crate's historical cap).
     max_kill_ring: usize,
@@ -327,6 +344,7 @@ impl Default for EditorConfig {
             show_mode_in_prompt: false,
             search_ignore_case: false,
             completion_query_items: 100,
+            completion_append: Some(' '),
             max_kill_ring: 32,
             max_undo: 200,
         }
@@ -601,6 +619,14 @@ impl Editor {
     /// default, like readline.
     pub fn set_search_ignore_case(&mut self, on: bool) {
         self.cfg.search_ignore_case = on;
+    }
+
+    /// The character appended after a unique, fully-inserted completion —
+    /// readline's `rl_completion_append_character`, so accepting the only
+    /// match leaves the cursor ready for the next word. The default is a
+    /// space, like readline; `None` appends nothing.
+    pub fn set_completion_append_character(&mut self, c: Option<char>) {
+        self.cfg.completion_append = c;
     }
 
     /// Ask "Display all N possibilities? (y or n)" before printing a
@@ -1148,6 +1174,9 @@ static DEFAULT_BINDINGS: &[(Key, EditorAction)] = &[
     (Key::Ctrl('o'), EditorAction::OperateAndGetNext),
     (Key::Tab, EditorAction::Complete),
     (Key::BackTab, EditorAction::MenuCompleteBackward),
+    (Key::Alt('?'), EditorAction::PossibleCompletions),
+    (Key::Alt('*'), EditorAction::InsertCompletions),
+    (Key::Ctrl(']'), EditorAction::CharacterSearch),
     (Key::Ctrl('v'), EditorAction::QuotedInsert),
     (Key::Ctrl('q'), EditorAction::QuotedInsert),
 ];
@@ -1317,6 +1346,18 @@ fn decode_escape_bytes(rest: &[u8]) -> Option<Key> {
         }
         0x7f => one(Key::AltBackspace),
         c if c.is_ascii_graphic() => one(Key::Alt(c as char)),
+        // Meta + a multibyte character (`\M-ö`): the ESC prefix followed
+        // by one whole UTF-8 sequence.
+        c if c >= 0x80 => {
+            let mut bytes = vec![c];
+            bytes.extend_from_slice(rest);
+            let mut chars = std::str::from_utf8(&bytes).ok()?.chars();
+            let ch = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            Some(Key::Alt(ch))
+        }
         _ => None,
     }
 }
@@ -1436,6 +1477,14 @@ fn read_key(hooks: &dyn Hooks) -> io::Result<Option<Key>> {
                 },
                 Some(0x7f) => Key::AltBackspace,
                 Some(c) if c.is_ascii_graphic() => Key::Alt(c as char),
+                // A meta-prefixed multibyte character (Alt-ö, any
+                // non-ASCII layout): assemble the whole UTF-8 sequence —
+                // consuming only the lead byte left the continuations to
+                // decode as garbage keys.
+                Some(c) if c >= 0x80 => match read_utf8(hooks, c)? {
+                    '\u{fffd}' => Key::Other,
+                    ch => Key::Alt(ch),
+                },
                 _ => Key::Other,
             }
         }
@@ -1510,20 +1559,35 @@ fn display_width(s: &str) -> usize {
 /// what Enter returns; this transform exists only so the render and its
 /// cursor math never emit a raw control byte at the terminal.
 #[cfg(unix)]
-fn visualize(s: &str) -> String {
+fn visualize(s: &str, start_col: usize) -> String {
     let mut out = String::with_capacity(s.len());
+    let mut col = start_col;
     for c in s.chars() {
+        // Tabs expand to the next 8-column stop of the running display
+        // offset (`start_col` is where this text begins — the prompt
+        // width for the buffer), so tab-indented content lines up the
+        // way every terminal renders it, not at a fixed four spaces.
+        if c == '\t' {
+            let pad = 8 - (col % 8);
+            out.extend(std::iter::repeat_n(' ', pad));
+            col += pad;
+            continue;
+        }
+        // Track the column by measuring what was actually appended, so
+        // the expansion can never drift from the cursor math.
+        let before = out.len();
         push_vis_char(&mut out, c);
+        col += display_width(&out[before..]);
     }
     out
 }
 
-/// One character of [`visualize`]'s transform.
+/// One character of [`visualize`]'s transform — everything except tabs,
+/// whose expansion is position-dependent and handled by the callers.
 #[cfg(unix)]
 fn push_vis_char(out: &mut String, c: char) {
     match c {
         '\n' => out.push('⏎'),
-        '\t' => out.push_str("    "),
         '\u{7f}' => out.push_str("^?"),
         c if (c as u32) < 0x20 => {
             out.push('^');
@@ -1539,8 +1603,9 @@ fn push_vis_char(out: &mut String, c: char) {
 /// transform around the color markup. A non-SGR escape from the hook is
 /// visualized (`^[`) rather than sent to the terminal.
 #[cfg(unix)]
-fn visualize_keep_sgr(s: &str) -> String {
+fn visualize_keep_sgr(s: &str, start_col: usize) -> String {
     let mut out = String::with_capacity(s.len());
+    let mut col = start_col;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' && chars.peek() == Some(&'[') {
@@ -1556,20 +1621,31 @@ fn visualize_keep_sgr(s: &str) -> String {
                 }
             }
             if fin == Some('m') {
+                // Zero display width: the column doesn't advance.
                 out.push_str("\x1b[");
                 out.push_str(&body);
                 out.push('m');
             } else {
                 // Not SGR: neutralize the ESC, keep the rest as text.
+                let before = out.len();
                 out.push_str("^[[");
                 out.push_str(&body);
                 if let Some(f) = fin {
                     push_vis_char(&mut out, f);
                 }
+                col += display_width(&out[before..]);
             }
             continue;
         }
+        if c == '\t' {
+            let pad = 8 - (col % 8);
+            out.extend(std::iter::repeat_n(' ', pad));
+            col += pad;
+            continue;
+        }
+        let before = out.len();
         push_vis_char(&mut out, c);
+        col += display_width(&out[before..]);
     }
     out
 }
@@ -1585,6 +1661,9 @@ enum Action {
     KillBack,
     Yank,
     LastArg,
+    /// A PageUp/PageDown prefix search — consecutive presses keep the
+    /// anchored prefix; anything else re-anchors the next search.
+    PrefixSearch,
     Undo,
     Other,
 }
@@ -1631,6 +1710,9 @@ struct LineState<'a> {
     undo: VecDeque<(String, usize)>,
     prev_action: Action,
     this_action: Action,
+    /// Length of the current coalesced self-insert undo group (capped at
+    /// 20, readline's chunk size).
+    insert_run: usize,
     /// Last yank's span and ring index, for M-y yank-pop.
     yank: Option<(usize, usize, usize)>,
     /// Last M-. insertion: (history index, span start, span end).
@@ -1715,6 +1797,7 @@ fn read_line_raw(
         undo: VecDeque::new(),
         prev_action: Action::Other,
         this_action: Action::Other,
+        insert_run: 0,
         yank: None,
         lastarg: None,
         menu: None,
@@ -1898,21 +1981,34 @@ fn read_line_raw(
             }
         }
 
-        // Undo bookkeeping: snapshot any mutation, coalescing runs of
-        // plain self-insert (readline groups those too).
-        if st.buffer != snapshot.0 && st.this_action != Action::Undo {
-            let coalesce = st.this_action == Action::Insert && st.prev_action == Action::Insert;
-            if !coalesce {
-                st.undo.push_back(snapshot);
-                while st.undo.len() > st.cfg.max_undo {
-                    st.undo.pop_front();
-                }
-            }
-        }
+        record_undo(&mut st, snapshot);
         st.prev_action = st.this_action;
 
         render(&mut st, history)?;
     }
+}
+
+/// Post-key undo bookkeeping: snapshot any mutation, coalescing runs of
+/// plain self-insert in groups of at most 20 characters — readline's
+/// chunking, so one undo doesn't wipe an entire typed line.
+#[cfg(unix)]
+fn record_undo(st: &mut LineState, snapshot: (String, usize)) {
+    if st.buffer == snapshot.0 || st.this_action == Action::Undo {
+        return;
+    }
+    let coalesce =
+        st.this_action == Action::Insert && st.prev_action == Action::Insert && st.insert_run < 20;
+    if !coalesce {
+        st.undo.push_back(snapshot);
+        while st.undo.len() > st.cfg.max_undo {
+            st.undo.pop_front();
+        }
+    }
+    st.insert_run = match (st.this_action, coalesce) {
+        (Action::Insert, true) => st.insert_run + 1,
+        (Action::Insert, false) => 1,
+        _ => 0,
+    };
 }
 
 /// Move to the end of the painted region and start a fresh terminal line,
@@ -2037,7 +2133,16 @@ fn bell(style: BellStyle) -> io::Result<()> {
         BellStyle::None => return Ok(()),
         BellStyle::Audible => print!("\x07"),
         // Reverse-video flip — the flash without terminfo's `flash`.
-        BellStyle::Visible => print!("\x1b[?5h\x1b[?5l"),
+        BellStyle::Visible => {
+            // Hold the reverse-video flash long enough to actually
+            // render (terminfo's `flash` pauses too — set-then-unset in
+            // one write can show zero frames). The poll keeps input
+            // responsive: a keystroke just ends the flash early.
+            print!("\x1b[?5h");
+            io::stdout().flush()?;
+            let _ = input_ready(80);
+            print!("\x1b[?5l");
+        }
     }
     io::stdout().flush()
 }
@@ -2231,6 +2336,35 @@ fn run_action(
             }
             menu_step(st, true);
         }
+        EditorAction::PossibleCompletions => {
+            // M-?: list the candidates without touching the buffer — no
+            // LCP insertion, no menu cycling armed.
+            let (_, mut candidates) = st.hooks.complete(&st.buffer, st.cursor);
+            if candidates.is_empty() {
+                bell(st.cfg.bell)?;
+            } else {
+                candidates.sort_by(|a, b| a.display.cmp(&b.display));
+                list_candidates(st, &candidates)?;
+            }
+        }
+        EditorAction::InsertCompletions => {
+            // M-*: insert every match, space-separated (readline).
+            let (start, mut candidates) = st.hooks.complete(&st.buffer, st.cursor);
+            if candidates.is_empty() {
+                bell(st.cfg.bell)?;
+            } else {
+                candidates.sort_by(|a, b| a.display.cmp(&b.display));
+                let joined = candidates
+                    .iter()
+                    .map(|c| c.replacement.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                st.buffer.replace_range(start..st.cursor, &joined);
+                st.cursor = start + joined.len();
+            }
+        }
+        EditorAction::CharacterSearch => character_search(st, false)?,
+        EditorAction::CharacterSearchBackward => character_search(st, true)?,
         EditorAction::QuotedInsert => quoted_insert(st)?,
     }
     Ok(AfterKey::Done)
@@ -2512,9 +2646,10 @@ fn handle_vi_normal(st: &mut LineState, key: Key, history: &[String], ring: &mut
             }
         }
         Key::Delete => {
-            if let Some(next) = next_char_end(&st.buffer, st.cursor) {
-                st.buffer.replace_range(st.cursor..next, "");
-            }
+            // The Delete key is `x` (vim): the text goes into the ring
+            // instead of vanishing.
+            let end = fwd_n(&st.buffer, st.cursor, n);
+            kill_span(st, ring, st.cursor, end, true);
         }
         _ => {}
     }
@@ -2631,7 +2766,8 @@ fn handle_search_key(
         Key::Enter => {
             if let Some(hit) = search.hit {
                 st.buffer = history[hit].clone();
-                st.cursor = st.buffer.len();
+                // The cursor lands on the match, like readline's point.
+                st.cursor = match_pos(&st.buffer, &search.query, ci).unwrap_or(st.buffer.len());
             }
             st.search = None;
             return Ok(SearchOutcome::Accept);
@@ -2671,10 +2807,12 @@ fn handle_search_key(
         }
         _ => {
             // Any other key: keep the match as the edit buffer and leave
-            // search mode.
+            // search mode, the cursor on the matched text (readline
+            // leaves point at the found location — you searched for it
+            // to edit it).
             if let Some(hit) = search.hit {
                 st.buffer = history[hit].clone();
-                st.cursor = st.buffer.len();
+                st.cursor = match_pos(&st.buffer, &search.query, ci).unwrap_or(st.buffer.len());
             }
             st.search = None;
             return Ok(SearchOutcome::Exit);
@@ -2684,6 +2822,23 @@ fn handle_search_key(
         bell(st.cfg.bell)?;
     }
     Ok(SearchOutcome::Continue)
+}
+
+/// Byte offset of the first occurrence of `needle` in `hay`, matched the
+/// same way the search matched it — where the cursor lands when a search
+/// is accepted or exited.
+fn match_pos(hay: &str, needle: &str, ignore_case: bool) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    if !ignore_case {
+        return hay.find(needle);
+    }
+    // Case-insensitive: probe every char boundary (lowercasing can change
+    // byte lengths, so a lowercase `find` offset wouldn't map back).
+    hay.char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| starts_with_match(&hay[i..], needle, true))
 }
 
 /// Substring match, optionally case-insensitive (readline 8.1's
@@ -3212,6 +3367,25 @@ fn insert_last_arg(st: &mut LineState, history: &[String]) {
     st.this_action = Action::LastArg;
 }
 
+/// C-] (readline `character-search`): read one character and move the
+/// cursor to its next occurrence — backward for
+/// `character-search-backward`. Reuses the vi `f`/`F` find machinery.
+#[cfg(unix)]
+fn character_search(st: &mut LineState, backward: bool) -> io::Result<()> {
+    if !wait_for_key(st)? {
+        return Ok(()); // deadline: the main loop times out
+    }
+    let Some(Key::Char(target)) = read_key(st.hooks)? else {
+        return Ok(()); // a non-character key aborts, like readline
+    };
+    let kind = if backward { 'F' } else { 'f' };
+    match vi_find_target(&st.buffer, st.cursor, kind, target) {
+        Some((t, _)) => st.cursor = t,
+        None => bell(st.cfg.bell)?,
+    }
+    Ok(())
+}
+
 /// C-v / C-q: insert the next key literally (a tab, an ESC, a ^C…);
 /// the render shows it `^X`-style.
 #[cfg(unix)]
@@ -3377,8 +3551,14 @@ fn history_last(st: &mut LineState) {
 /// cursor (zsh's `history-beginning-search-backward`, fish's Up).
 #[cfg(unix)]
 fn history_prefix_prev(st: &mut LineState, history: &[String]) {
-    if st.hist_index.is_none() {
+    // Re-anchor on the buffer up to the cursor whenever the previous key
+    // wasn't itself a prefix search (zsh's rule) — anchoring only when
+    // off history left a stale/empty prefix after a plain Up.
+    if st.prev_action != Action::PrefixSearch {
         st.prefix = st.buffer[..st.cursor].to_string();
+    }
+    st.this_action = Action::PrefixSearch;
+    if st.hist_index.is_none() {
         st.draft = st.buffer.clone();
     }
     let below = st.hist_index.unwrap_or(history.len());
@@ -3398,6 +3578,7 @@ fn history_prefix_prev(st: &mut LineState, history: &[String]) {
 /// PageDown / M-n: next prefix match, or back to the draft.
 #[cfg(unix)]
 fn history_prefix_next(st: &mut LineState, history: &[String]) {
+    st.this_action = Action::PrefixSearch;
     let Some(cur) = st.hist_index else { return };
     let ci = st.cfg.search_ignore_case;
     if let Some(off) = history[cur + 1..]
@@ -3436,40 +3617,27 @@ fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
         st.cfg.completion_ignore_case,
     );
     let current = &st.buffer[start..st.cursor];
-    if lcp.len() > current.len() {
+    let progressed = lcp.len() > current.len();
+    if progressed {
         st.buffer.replace_range(start..st.cursor, &lcp);
         st.cursor = start + lcp.len();
-        // show-all-if-ambiguous (readline): list right away instead of
-        // waiting for a second Tab after the prefix insertion.
-        if !(st.cfg.show_all_if_ambiguous && candidates.len() > 1) {
-            return Ok(());
-        }
     }
-    if candidates.len() > 1 {
-        // Leave the edit region; the next render starts a fresh region
-        // below whatever gets printed.
-        finish_line(st)?;
-        st.painted_rows = 1;
-        st.painted_cursor_row = 0;
-        st.fresh_region = true;
-        // readline's completion-query-items: a big list asks first.
-        if st.cfg.completion_query_items > 0 && candidates.len() >= st.cfg.completion_query_items {
-            print!("Display all {} possibilities? (y or n)", candidates.len());
-            io::stdout().flush()?;
-            if !wait_for_key(st)? {
-                println!();
-                return Ok(()); // deadline: the main loop times out
-            }
-            let yes = matches!(
-                read_key(st.hooks)?,
-                Some(Key::Char('y' | 'Y' | ' ')) | Some(Key::Tab)
-            );
-            println!();
-            if !yes {
-                return Ok(());
-            }
+    if candidates.len() == 1 {
+        // A unique match, now fully inserted: append the completion
+        // append character (readline's, a space by default) so the
+        // cursor is ready for the next word.
+        if let Some(c) = st.cfg.completion_append {
+            st.buffer.insert(st.cursor, c);
+            st.cursor += c.len_utf8();
         }
-        print_candidate_columns(&candidates);
+        return Ok(());
+    }
+    // show-all-if-ambiguous (readline): list right away instead of
+    // waiting for a second Tab after the prefix insertion.
+    if progressed && !st.cfg.show_all_if_ambiguous {
+        return Ok(());
+    }
+    if list_candidates(st, &candidates)? {
         st.menu = Some(MenuState {
             start,
             inserted: st.cursor - start,
@@ -3478,6 +3646,37 @@ fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
         });
     }
     Ok(())
+}
+
+/// Leave the edit region and print the candidate list (behind the
+/// `completion-query-items` question when it's big). `false` when the
+/// user declined or the deadline passed — nothing was listed.
+#[cfg(unix)]
+fn list_candidates(st: &mut LineState, candidates: &[Candidate]) -> io::Result<bool> {
+    // The next render starts a fresh region below whatever gets printed.
+    finish_line(st)?;
+    st.painted_rows = 1;
+    st.painted_cursor_row = 0;
+    st.fresh_region = true;
+    // readline's completion-query-items: a big list asks first.
+    if st.cfg.completion_query_items > 0 && candidates.len() >= st.cfg.completion_query_items {
+        print!("Display all {} possibilities? (y or n)", candidates.len());
+        io::stdout().flush()?;
+        if !wait_for_key(st)? {
+            println!();
+            return Ok(false); // deadline: the main loop times out
+        }
+        let yes = matches!(
+            read_key(st.hooks)?,
+            Some(Key::Char('y' | 'Y' | ' ')) | Some(Key::Tab)
+        );
+        println!();
+        if !yes {
+            return Ok(false);
+        }
+    }
+    print_candidate_columns(candidates);
+    Ok(true)
 }
 
 /// Print the candidate list in vertical (column-major) order, the way
@@ -3656,7 +3855,8 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
             (true, false) => "(failed reverse-i-search)",
             (true, true) => "(failed i-search)",
         };
-        let line = format!("{label}`{}': {}", search.query, visualize(shown));
+        let head = format!("{label}`{}': ", search.query);
+        let line = format!("{}{}", head, visualize(shown, display_width(&head)));
         out.push_str(&line);
         out.push_str("\x1b[J");
         let w = display_width(&line);
@@ -3681,22 +3881,6 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
         }
     }
 
-    let vis = visualize(&st.buffer);
-    // The host highlights the raw buffer (true text, true offsets); its
-    // SGR markup survives and everything else is re-visualized. A buffer
-    // holding a literal ESC is painted unhighlighted — hook markup and
-    // buffer bytes would be indistinguishable.
-    let highlighted = if st.buffer.contains('\x1b') {
-        vis.clone()
-    } else {
-        visualize_keep_sgr(&st.hooks.highlight(&st.buffer))
-    };
-    let hint = if st.cursor == st.buffer.len() {
-        visualize(&cached_hint(st, history).unwrap_or_default())
-    } else {
-        String::new()
-    };
-
     // readline's show-mode-in-prompt, with its default mode strings
     // (prefixed to the prompt's final line).
     let mode = if !st.cfg.show_mode_in_prompt {
@@ -3708,11 +3892,28 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
     } else {
         "(ins)"
     };
-
+    // Buffer visualization starts at the prompt's end column: tab stops
+    // depend on it.
     let wp = display_width(mode) + display_width(prompt_line);
+
+    let vis = visualize(&st.buffer, wp);
+    // The host highlights the raw buffer (true text, true offsets); its
+    // SGR markup survives and everything else is re-visualized. A buffer
+    // holding a literal ESC is painted unhighlighted — hook markup and
+    // buffer bytes would be indistinguishable.
+    let highlighted = if st.buffer.contains('\x1b') {
+        vis.clone()
+    } else {
+        visualize_keep_sgr(&st.hooks.highlight(&st.buffer), wp)
+    };
     let wb = display_width(&vis);
+    let hint = if st.cursor == st.buffer.len() {
+        visualize(&cached_hint(st, history).unwrap_or_default(), wp + wb)
+    } else {
+        String::new()
+    };
     let wh = display_width(&hint);
-    let wcursor = wp + display_width(&visualize(&st.buffer[..st.cursor]));
+    let wcursor = wp + display_width(&visualize(&st.buffer[..st.cursor], wp));
     let wtotal = wp + wb + wh;
 
     out.push_str(mode);
@@ -3795,6 +3996,7 @@ mod tests {
             undo: VecDeque::new(),
             prev_action: Action::Other,
             this_action: Action::Other,
+            insert_run: 0,
             yank: None,
             lastarg: None,
             menu: None,
@@ -3867,11 +4069,16 @@ mod tests {
     fn visualize_control_chars() {
         #[cfg(unix)]
         {
-            assert_eq!(visualize("plain"), "plain");
-            assert_eq!(visualize("a\x1bb"), "a^[b");
-            assert_eq!(visualize("a\tb"), "a    b");
-            assert_eq!(visualize("a\nb"), "a⏎b");
-            assert_eq!(visualize("\u{7f}"), "^?");
+            assert_eq!(visualize("plain", 0), "plain");
+            assert_eq!(visualize("a\x1bb", 0), "a^[b");
+            // Tabs advance to the next 8-column stop of the running
+            // display offset, prompt included — not a fixed four spaces.
+            assert_eq!(visualize("a\tb", 0), "a       b"); // col 1 → pad 7
+            assert_eq!(visualize("\tb", 0), "        b"); // col 0 → pad 8
+            assert_eq!(visualize("a\tb", 6), "a b"); // col 7 → pad 1
+            assert_eq!(visualize("日\tb", 0), "日      b"); // wide char: col 2
+            assert_eq!(visualize("a\nb", 0), "a⏎b");
+            assert_eq!(visualize("\u{7f}", 0), "^?");
         }
     }
 
@@ -4005,14 +4212,37 @@ mod tests {
             "git push".to_string(),
         ];
         let mut st = state("git", 3);
+        // Consecutive presses keep the anchor (the main loop's
+        // prev_action bookkeeping, mirrored here between calls).
         history_prefix_prev(&mut st, &history);
+        st.prev_action = st.this_action;
         assert_eq!(st.buffer, "git push");
         history_prefix_prev(&mut st, &history);
+        st.prev_action = st.this_action;
         assert_eq!(st.buffer, "git status"); // skipped "echo git"
         history_prefix_next(&mut st, &history);
+        st.prev_action = st.this_action;
         assert_eq!(st.buffer, "git push");
         history_prefix_next(&mut st, &history);
+        st.prev_action = st.this_action;
         assert_eq!(st.buffer, "git"); // back to the draft
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefix_search_reanchors_after_other_keys() {
+        let history = vec!["echo x".to_string(), "git status".to_string()];
+        // Plain Up recalls "git status"; a following PageUp must anchor
+        // on the *current* buffer up to the cursor — the old behavior
+        // kept a stale empty prefix and walked to "echo x".
+        let mut st = state("git", 3);
+        st.cfg.bell = BellStyle::None;
+        history_prev(&mut st, &history);
+        st.prev_action = st.this_action; // Action::Other
+        assert_eq!(st.buffer, "git status");
+        history_prefix_prev(&mut st, &history);
+        assert_eq!(st.buffer, "git status", "no earlier 'git status…' entry");
+        assert_eq!(st.prefix, "git status");
     }
 
     #[test]
@@ -4592,14 +4822,15 @@ mod tests {
     #[test]
     fn visualize_keep_sgr_passes_color_and_transforms_the_rest() {
         // SGR passes through; tabs/newlines/control chars still render.
+        // SGR is zero-width, so the tab after "red" pads from column 3.
         assert_eq!(
-            visualize_keep_sgr("\x1b[31mred\x1b[0m\ta\n"),
-            "\x1b[31mred\x1b[0m    a⏎"
+            visualize_keep_sgr("\x1b[31mred\x1b[0m\ta\n", 0),
+            "\x1b[31mred\x1b[0m     a⏎"
         );
         // A non-SGR escape from a misbehaving hook is neutralized, not
         // sent to the terminal.
-        assert_eq!(visualize_keep_sgr("\x1b[2J"), "^[[2J");
-        assert_eq!(visualize_keep_sgr("plain"), "plain");
+        assert_eq!(visualize_keep_sgr("\x1b[2J", 0), "^[[2J");
+        assert_eq!(visualize_keep_sgr("plain", 0), "plain");
     }
 
     #[test]
@@ -4673,6 +4904,121 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_exit_places_cursor_on_the_match() {
+        assert_eq!(match_pos("echo --foo bar", "--foo", false), Some(5));
+        assert_eq!(match_pos("Echo FOO", "foo", true), Some(5));
+        assert_eq!(match_pos("abc", "zz", false), None);
+        let history = vec!["echo --verbose x".to_string()];
+        let mut st = state("", 0);
+        st.cfg.bell = BellStyle::None;
+        start_search(&mut st, false);
+        for c in "--v".chars() {
+            handle_search_key(&mut st, Key::Char(c), &history).unwrap();
+        }
+        // Exiting with a non-search key keeps the match and puts the
+        // cursor on it (readline's point), not at end-of-line.
+        handle_search_key(&mut st, Key::Left, &history).unwrap();
+        assert_eq!(st.buffer, "echo --verbose x");
+        assert_eq!(st.cursor, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_insert_groups_cap_at_20() {
+        let mut st = state("", 0);
+        // Simulate the main loop: type 45 characters one at a time.
+        for i in 0..45 {
+            let snapshot = (st.buffer.clone(), st.cursor);
+            insert_char(&mut st, 'a');
+            st.this_action = Action::Insert;
+            record_undo(&mut st, snapshot);
+            st.prev_action = st.this_action;
+            let _ = i;
+        }
+        // 45 inserts → groups of 20/20/5 → 3 snapshots, not 1, not 45.
+        assert_eq!(st.undo.len(), 3);
+        undo_cmd(&mut st);
+        assert_eq!(st.buffer.len(), 40, "one undo removes one 20-char group");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vi_delete_key_kills_into_the_ring() {
+        let history: Vec<String> = Vec::new();
+        let mut ring = VecDeque::new();
+        let mut st = state("abc", 0);
+        handle_vi_normal(&mut st, Key::Delete, &history, &mut ring);
+        assert_eq!(st.buffer, "bc");
+        assert_eq!(ring.back().map(String::as_str), Some("a"));
+    }
+
+    #[test]
+    fn alt_multibyte_chords_decode() {
+        assert_eq!(parse_key_spec("\\M-ö"), Some(Key::Alt('ö')));
+        assert_eq!(parse_key_spec("\\eö"), Some(Key::Alt('ö')));
+        // And the spec printer round-trips it.
+        assert_eq!(
+            parse_key_spec(&key_spec(&Key::Alt('ö'))),
+            Some(Key::Alt('ö'))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unique_completion_appends_the_append_character() {
+        struct H;
+        impl Hooks for H {
+            fn complete(&self, _line: &str, _pos: usize) -> (usize, Vec<Candidate>) {
+                (
+                    0,
+                    vec![Candidate {
+                        display: "alpha".to_string(),
+                        replacement: "alpha".to_string(),
+                    }],
+                )
+            }
+        }
+        let mut ring = VecDeque::new();
+        let mut st = state_hooked("al", 2, &H);
+        run_action(&mut st, EditorAction::Complete, &Key::Tab, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "alpha ");
+        assert_eq!(st.cursor, 6);
+        // Disabled: the bare match is inserted.
+        let mut st = state_hooked("al", 2, &H);
+        st.cfg.completion_append = None;
+        run_action(&mut st, EditorAction::Complete, &Key::Tab, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "alpha");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insert_completions_inserts_all_matches() {
+        struct H;
+        impl Hooks for H {
+            fn complete(&self, _line: &str, _pos: usize) -> (usize, Vec<Candidate>) {
+                let cand = |s: &str| Candidate {
+                    display: s.to_string(),
+                    replacement: s.to_string(),
+                };
+                (0, vec![cand("beta"), cand("alpha")])
+            }
+        }
+        let mut ring = VecDeque::new();
+        let mut st = state_hooked("a", 1, &H);
+        run_action(
+            &mut st,
+            EditorAction::InsertCompletions,
+            &Key::Alt('*'),
+            &[],
+            &mut ring,
+        )
+        .unwrap();
+        assert_eq!(st.buffer, "alpha beta"); // sorted, space-separated
+        assert_eq!(st.cursor, 10);
     }
 
     #[cfg(unix)]
