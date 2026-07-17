@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.4.0 — 2026-07-17
+
+- Ninth review pass: self-review of the previous performance pass, plus
+  documentation and CI hygiene.
+  - Fix: `render_owed` wasn't cleared after incremental search's own
+    unconditional repaint (`SearchOutcome::Continue`/`Exit`) — entering
+    search mid-coalesced-burst left the flag stale, causing one
+    harmless but wasted extra render at the next `finish_line`. New pty
+    test (`burst_into_search_paints_correctly`) covers entering and
+    accepting a search within a single coalesced read.
+  - Fix: repaint coalescing had no bound — a continuous input flood (a
+    huge unbracketed paste, runaway automation) could show zero visual
+    progress for as long as it lasted, indistinguishable from a hang.
+    Capped at `MAX_COALESCED_RUN` (200): a paint is now forced
+    periodically regardless of queued input. New pty test
+    (`very_large_flood_completes_and_is_not_lost`) guards against
+    regressions past the cap.
+  - Docs: `term_sys::apply_raw_flags`'s doc comment said "one byte at a
+    time," left over from before buffered reads — corrected to explain
+    `VMIN`/`VTIME`'s actual (call-size-independent) semantics.
+    `CLAUDE.md` and the crate-level doc header now describe repaint
+    coalescing, which the previous pass added without updating either.
+  - CI: a new `bench` job builds and clippy-lints `bench/` (which,
+    being outside the workspace, was previously unverified by any CI
+    job) — build/lint only, not a full run, to avoid pty-timing
+    flakiness in CI.
 - Performance: two fixes driven by `bench/`'s numbers, both internal
   (no API or behavior change; the pty test suite gained several tests
   targeting the exact hazard the second one had to avoid).

@@ -369,6 +369,37 @@ fn long_burst_into_enter_paints_correctly() {
 }
 
 #[test]
+fn very_large_flood_completes_and_is_not_lost() {
+    // A flood well past the coalescing cap (MAX_COALESCED_RUN = 200):
+    // periodic forced paints must not corrupt the final state, and the
+    // editor must not hang waiting on anything it shouldn't.
+    let line = "z".repeat(3000);
+    let chunk = format!("{line}\r");
+    let out = run_session(&[chunk.as_bytes()]);
+    assert!(
+        out.contains(&echo(&line)),
+        "flood past the coalescing cap lost or corrupted text"
+    );
+}
+
+#[test]
+fn burst_into_search_paints_correctly() {
+    // Seed history with "one", then in a fresh line, burst two junk
+    // characters immediately followed — in the SAME write, so the
+    // editor reads them in one syscall — by C-r and a matching query.
+    // Entering search mid-coalesced-burst takes a different render path
+    // (search's own unconditional render, not the main loop's), which
+    // must still leave `render_owed` correctly settled by the time
+    // Enter accepts the match.
+    let out = run_session(&[b"one\r", b"xy\x12on\r"]);
+    let hits = out.matches(&echo("one")).count();
+    assert!(
+        hits >= 2,
+        "expected 'one' echoed twice (typed + found via search):\n{out}"
+    );
+}
+
+#[test]
 fn character_search_moves_to_the_typed_char() {
     // C-a to column 0, C-] then 'l' jumps onto the first 'l', C-d
     // deletes it (readline character-search).

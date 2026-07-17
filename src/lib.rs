@@ -20,16 +20,19 @@
 //!     with modifier parameters — Ctrl/Alt-arrows — Alt- chords, and the
 //!     bracketed-paste envelope), with a short poll to tell a lone ESC
 //!     from a sequence;
-//!   * a render engine that repaints the whole edit region per keystroke
-//!     (overwriting in place, clearing only the leftover tail — no
-//!     flicker): display-width math (via `unicode_width`, aware of both
-//!     CSI and OSC escapes), a readline-style `^X` visualization for
-//!     control characters in the buffer, soft-wrap row accounting,
-//!     forced wraps at exact column boundaries (avoiding the
-//!     delayed-wrap ambiguity), multi-line prompts (prefix lines print
-//!     once per region), syntax highlighting of the raw buffer, the
-//!     dimmed history hint, and a right-side prompt (zsh's `$RPS1`),
-//!     shown while the first row has room for it;
+//!   * a render engine that repaints the whole edit region — never a
+//!     diff, so cursor math stays exact — overwriting in place and
+//!     clearing only the leftover tail (no flicker); repaints coalesce
+//!     while more input is already queued (readline's trick, capped so
+//!     a large flood still shows progress), so a keystroke isn't always
+//!     synchronously followed by a paint. Display-width math (via
+//!     `unicode_width`, aware of both CSI and OSC escapes), a
+//!     readline-style `^X` visualization for control characters in the
+//!     buffer, soft-wrap row accounting, forced wraps at exact column
+//!     boundaries (avoiding the delayed-wrap ambiguity), multi-line
+//!     prompts (prefix lines print once per region), syntax highlighting
+//!     of the raw buffer, the dimmed history hint, and a right-side
+//!     prompt (zsh's `$RPS1`), shown while the first row has room for it;
 //!   * keymaps: the emacs set (kill ring with yank/yank-pop, undo,
 //!     word-wise motion/kill/case/transpose, insert-last-argument,
 //!     operate-and-get-next, quoted-insert, edit-in-`$EDITOR`) by
@@ -2041,6 +2044,11 @@ struct LineState<'a> {
     /// where `painted_rows`/`painted_cursor_row` say, which is only true
     /// immediately after a real (unskipped) render.
     render_owed: bool,
+    /// How many repaints in a row have been coalesced away. Capped (see
+    /// the main loop's bottom) so a very large or continuous input flood
+    /// — an unbracketed paste, a runaway automation script — still shows
+    /// periodic progress instead of looking frozen until the flood ends.
+    coalesced_run: u32,
     /// History navigation: index into `history` (None = live line), the
     /// draft stashed when navigation started, and the anchored prefix for
     /// PageUp/PageDown prefix search.
@@ -2169,6 +2177,7 @@ fn read_line_raw(
         painted_cursor_row: 0,
         fresh_region: true,
         render_owed: false,
+        coalesced_run: 0,
         hist_index: None,
         draft: String::new(),
         prefix: String::new(),
@@ -2247,12 +2256,14 @@ fn read_line_raw(
                 writeln!(io::stdout())?;
                 render(&mut st, history)?;
                 st.render_owed = false; // just painted for real
+                st.coalesced_run = 0;
             }
             let now = term_cols();
             if now != cols {
                 cols = now;
                 render(&mut st, history)?;
                 st.render_owed = false; // just painted for real
+                st.coalesced_run = 0;
             }
         }
 
@@ -2274,6 +2285,8 @@ fn read_line_raw(
             match handle_search_key(&mut st, key, history)? {
                 SearchOutcome::Continue | SearchOutcome::Exit => {
                     render(&mut st, history)?;
+                    st.render_owed = false; // just painted for real
+                    st.coalesced_run = 0;
                     continue;
                 }
                 SearchOutcome::Accept => {
@@ -2426,15 +2439,25 @@ fn read_line_raw(
         // draining a burst — and `render_owed` guarantees the next
         // `finish_line` (Enter, C-c, a completion listing, a host
         // binding, …) forces one fresh paint first, so its
-        // cursor-position math is never stale.
-        if input_ready(0) {
+        // cursor-position math is never stale. Capped at
+        // `MAX_COALESCED_RUN`: a continuous flood (a huge unbracketed
+        // paste, runaway automation) would otherwise show zero visual
+        // progress for as long as it lasts — indistinguishable from a
+        // hang — so a paint is forced periodically regardless.
+        if input_ready(0) && st.coalesced_run < MAX_COALESCED_RUN {
             st.render_owed = true;
+            st.coalesced_run += 1;
         } else {
             render(&mut st, history)?;
             st.render_owed = false;
+            st.coalesced_run = 0;
         }
     }
 }
+
+/// Cap on consecutive coalesced repaints — see the main loop's bottom.
+#[cfg(unix)]
+const MAX_COALESCED_RUN: u32 = 200;
 
 /// Post-key undo bookkeeping: snapshot any mutation, coalescing runs of
 /// plain self-insert — and runs of single-character deletes — in groups
@@ -2474,6 +2497,7 @@ fn finish_line(st: &mut LineState, history: &[String]) -> io::Result<()> {
     if st.render_owed {
         render(st, history)?;
         st.render_owed = false;
+        st.coalesced_run = 0;
     }
     let down = st.painted_rows.saturating_sub(1 + st.painted_cursor_row);
     let mut out = io::stdout().lock();
@@ -4575,6 +4599,7 @@ mod tests {
             painted_cursor_row: 0,
             fresh_region: true,
             render_owed: false,
+            coalesced_run: 0,
             hist_index: None,
             draft: String::new(),
             prefix: String::new(),

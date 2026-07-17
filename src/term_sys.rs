@@ -83,7 +83,13 @@ mod imp {
     /// discarded), no 7-bit stripping (`ISTRIP` would corrupt every
     /// UTF-8 high byte), no canonical mode, echo, signals, or
     /// literal-next; output stays cooked so ordinary `println!` still
-    /// works. One byte at a time, no read timeout.
+    /// works. `VMIN = 1, VTIME = 0`: a `read` blocks until at least one
+    /// byte is available, then returns immediately with whatever the
+    /// kernel already has queued — up to however many bytes the caller
+    /// asked for, not necessarily just one. `read_stdin_chunk` below
+    /// exploits exactly this to batch many already-queued keystrokes (or
+    /// a paste) into a single syscall instead of reading one byte at a
+    /// time.
     pub fn apply_raw_flags(t: &mut Termios) {
         t.c_iflag &= !(libc::IXON | libc::ICRNL | libc::INLCR | libc::IGNCR | libc::ISTRIP);
         t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
