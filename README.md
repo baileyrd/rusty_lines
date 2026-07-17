@@ -64,21 +64,24 @@ full per-editor survey behind this table is in
 | History cap: `set_max_history_len` drops oldest past the limit | readline `stifle_history`, bash `HISTSIZE` |
 | History dedup option: `set_history_dedup` erases earlier duplicates | bash `HISTCONTROL=erasedups`, fish |
 | History ignore-space option: `set_history_ignore_space` skips lines starting with a space | bash `HISTCONTROL=ignorespace`, zsh `HIST_IGNORE_SPACE` |
-| History persistence: `save_history` rewrites, `append_history` appends only new entries; `load_history` tolerates a rustyline `#V2` header | bash `histappend`; rustyline migration |
+| History persistence: `save_history` rewrites atomically (temp file + rename) and creates the file mode 0600, `append_history` appends only new entries; `load_history` tolerates a rustyline `#V2` header | bash `histappend` and its 0600 history file; rustyline migration |
 | Clear screen: C-l clears and repaints the edit region at the top | readline `clear-screen` |
 | Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search; a miss shows `(failed reverse-i-search)` and rings the bell, keeping the last match visible | readline, ZLE |
+| Case-insensitive search option: `set_search_ignore_case` covers incremental *and* prefix search | readline 8.1 `search-ignore-case` |
 | Bell on failed operations: no-match completion, history past either end, failed prefix search, failed vi find — all per `set_bell_style` | readline `bell-style` |
 | Prefix history search: PageUp/PageDown, M-p/M-n | ZLE `history-beginning-search`, fish Up, PSReadLine |
 | History hints (autosuggestions) via `Hooks::hint`, Right/End accepts; M-f / Ctrl-Right at end of line accepts one word | fish, PSReadLine, linenoise hints |
-| Syntax highlighting while typing via `Hooks::highlight` | fish, ZLE plugins, replxx |
+| Syntax highlighting while typing via `Hooks::highlight`: the hook paints the *raw* buffer (true text, true byte offsets); its SGR markup passes through and the editor re-applies control-char visualization around it | fish, ZLE plugins, replxx |
 | Tab completion via `Hooks::complete`: LCP insertion + sorted, column-major candidate list; big lists ask `Display all N possibilities? (y or n)` first (`set_completion_query_items`, default 100) | readline `CompletionType::List`, `completion-query-items` |
-| Menu cycling: Tab after the candidate list walks the candidates in-line, wrapping around | zsh `AUTO_MENU`, readline `menu-complete` |
+| Menu cycling: Tab after the candidate list walks the candidates in-line, wrapping around; Shift-Tab (`CSI Z`) cycles backward, starting from the last candidate | zsh `AUTO_MENU` / `reverse-menu-complete`, readline `menu-complete(-backward)` |
 | Abbreviation expansion on space via `Hooks::expand_abbreviation` | fish `abbr` |
 | Right-side prompt (second `read_line` argument), hidden when the line grows into it | zsh `$RPS1`, fish, reedline |
 | Bracketed paste: paste arrives as one event — tabs/ESC insert literally, nothing executes until Enter; inserts literally in vi normal mode too; multi-line pastes keep their newlines (shown `⏎`) and return as a unit; multi-line history entries stored joined with `; ` (bash `cmdhist`) | readline 8.1+, ZLE, fish, reedline |
-| vi mode (`Hooks::vi_mode`): counts; `d`/`c`/`y` operators over motions; `h l 0 ^ $ w W b B e E f F t T ; , %`; the `iw`/`aw` text objects; `x X D C s S Y r ~ p P u`; `i I a A`; `k`/`j` history, `G` fetches by count; `cw`≡`ce` quirk; Esc backs the cursor up one | readline vi mode, ksh, ZLE; vim (`%`, `G`, `iw`/`aw`) |
+| vi mode (`Hooks::vi_mode`): counts (motions and `x ~ r p P` — `3rx`, `3p`); `d`/`c`/`y` operators over motions; `h l 0 ^ $ w W b B e E f F t T ; , %`; the `iw`/`aw` text objects; `x X D C s S Y r ~ p P u`; `i I a A`; `k`/`j` history, `G` fetches by count; `cw`≡`ce` quirk; Esc backs the cursor up one | readline vi mode, ksh, ZLE; vim (`%`, `G`, `iw`/`aw`, counts) |
 | Mode indicator: `set_show_mode_in_prompt` prefixes `(ins)`/`(cmd)` (vi) or `@` (emacs) to the prompt | readline `show-mode-in-prompt` and its default mode strings |
-| Wide chars + UTF-8 input assembly; ANSI-aware width math; soft-wrap repaint; `^X` control-char visualization keeps cursor math exact | all modern |
+| Wide chars + UTF-8 input assembly; ANSI-aware width math (CSI *and* OSC — a hyperlinked or titled prompt measures correctly); soft-wrap repaint without flicker (paint-then-clear); `^X` control-char visualization keeps cursor math exact | all modern |
+| Multi-line prompts (`PS1` with newlines): the lines before the last paint once per region; only the final line is the repainted edit row | readline, zsh |
+| Robust escape decoding: unrecognized CSI sequences (SGR mouse reports, private modes) are consumed whole per ECMA-48 instead of leaking their tail into the buffer as typed text | readline, all modern |
 | Resize: width re-read on every repaint; a resize while idle at the prompt repaints within a poll tick (~200ms) | readline SIGWINCH, approximated without signals |
 | Key rebinding: `bind`/`unbind` accept readline key-spec spellings (`\C-x`, `\M-f`, `\e[1;5C`), remapping single keys to named `EditorAction`s; `bindings()` lists the effective keymap | readline `bind '"\C-x": kill-line'`, `bind -P`, `bind -r` |
 | Host-command bindings: `bind_host` + `Hooks::host_binding` — raw mode suspends, the host runs its command against the line/cursor, the edit resumes | bash `bind -x` (`READLINE_LINE`/`READLINE_POINT`) |

@@ -20,11 +20,14 @@
 //!     with modifier parameters — Ctrl/Alt-arrows — Alt- chords, and the
 //!     bracketed-paste envelope), with a short poll to tell a lone ESC
 //!     from a sequence;
-//!   * a render engine that repaints the whole edit region per keystroke:
-//!     display-width math (via `unicode_width`, ANSI-aware), a readline-
-//!     style `^X` visualization for control characters in the buffer,
-//!     soft-wrap row accounting, forced wraps at exact column boundaries
-//!     (avoiding the delayed-wrap ambiguity), syntax highlighting, the
+//!   * a render engine that repaints the whole edit region per keystroke
+//!     (overwriting in place, clearing only the leftover tail — no
+//!     flicker): display-width math (via `unicode_width`, aware of both
+//!     CSI and OSC escapes), a readline-style `^X` visualization for
+//!     control characters in the buffer, soft-wrap row accounting,
+//!     forced wraps at exact column boundaries (avoiding the
+//!     delayed-wrap ambiguity), multi-line prompts (prefix lines print
+//!     once per region), syntax highlighting of the raw buffer, the
 //!     dimmed history hint, and a right-side prompt (zsh's `$RPS1`),
 //!     shown while the first row has room for it;
 //!   * keymaps: the emacs set (kill ring with yank/yank-pop, undo,
@@ -104,8 +107,14 @@ pub trait Hooks {
     fn hint(&self, _line: &str, _history: &[String]) -> Option<String> {
         None
     }
-    /// The buffer as painted — return it wrapped in ANSI SGR sequences
-    /// for syntax highlighting (widths are computed ANSI-aware).
+    /// Syntax highlighting: `line` is the *raw* buffer text, exactly what
+    /// Enter would return — so a parser sees real tabs and newlines at
+    /// their true byte offsets. Return it with ANSI SGR sequences
+    /// (`ESC[…m`) inserted and the text itself unchanged; the editor
+    /// re-applies its control-character visualization (`^X`, `⏎`, tab
+    /// expansion) around the SGR markup afterwards, and widths are
+    /// computed ANSI-aware. A line containing a literal ESC character is
+    /// painted unhighlighted (the markup would be ambiguous).
     fn highlight(&self, line: &str) -> String {
         line.to_string()
     }
@@ -255,6 +264,9 @@ pub enum EditorAction {
     /// Insert the first completion candidate immediately; repeats cycle
     /// through the rest (`menu-complete`).
     MenuComplete,
+    /// Cycle the completion candidates backward — starting from the last
+    /// (`menu-complete-backward`, Shift-Tab; zsh `reverse-menu-complete`).
+    MenuCompleteBackward,
     /// Insert the next key literally (`quoted-insert`, C-v/C-q).
     QuotedInsert,
     /// Edit the line in `$VISUAL`/`$EDITOR` and execute the result
@@ -292,6 +304,9 @@ struct EditorConfig {
     menu_complete: bool,
     bell: BellStyle,
     show_mode_in_prompt: bool,
+    /// Case-insensitive history searching — incremental (C-r/C-s) and
+    /// prefix (PageUp/PageDown) both (readline 8.1 `search-ignore-case`).
+    search_ignore_case: bool,
     /// Candidate count at/past which the list prompts "Display all N
     /// possibilities?" first (readline `completion-query-items`; 0 = never).
     completion_query_items: usize,
@@ -310,6 +325,7 @@ impl Default for EditorConfig {
             menu_complete: false,
             bell: BellStyle::default(),
             show_mode_in_prompt: false,
+            search_ignore_case: false,
             completion_query_items: 100,
             max_kill_ring: 32,
             max_undo: 200,
@@ -579,6 +595,14 @@ impl Editor {
         self.cfg.show_mode_in_prompt = on;
     }
 
+    /// Case-insensitive history searching (readline 8.1's
+    /// `search-ignore-case`): C-r/C-s incremental search and the
+    /// PageUp/PageDown prefix search both match ignoring case. Off by
+    /// default, like readline.
+    pub fn set_search_ignore_case(&mut self, on: bool) {
+        self.cfg.search_ignore_case = on;
+    }
+
     /// Ask "Display all N possibilities? (y or n)" before printing a
     /// candidate list of `n` or more entries (readline's
     /// `completion-query-items`). The default is 100, like readline;
@@ -759,8 +783,12 @@ impl Editor {
     /// Write the history to `path`, one entry per line (preceded by a
     /// `#<epoch>` timestamp line when
     /// [`set_history_timestamps`](Editor::set_history_timestamps) is on).
+    /// The write is atomic (temp file + rename, so a crash mid-write
+    /// can't truncate an existing history) and a new file is created
+    /// mode 0600 on Unix, like bash's history file — history routinely
+    /// contains secrets. An existing file keeps its permissions.
     pub fn save_history(&mut self, path: &std::path::Path) -> io::Result<()> {
-        std::fs::write(path, self.format_entries(0))?;
+        write_history_atomic(path, self.format_entries(0).as_bytes())?;
         self.persisted = self.history.len();
         Ok(())
     }
@@ -768,14 +796,16 @@ impl Editor {
     /// Append only the entries added since the last `load_history`,
     /// `save_history`, or `append_history` call — bash's `histappend`:
     /// concurrent sessions interleave instead of overwriting each other.
+    /// A file this call creates is mode 0600 on Unix, like bash's.
     pub fn append_history(&mut self, path: &std::path::Path) -> io::Result<()> {
         let from = self.persisted.min(self.history.len());
         if from < self.history.len() {
             use std::io::Write as _;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+            let mut f = opts.open(path)?;
             f.write_all(self.format_entries(from).as_bytes())?;
         }
         self.persisted = self.history.len();
@@ -843,6 +873,36 @@ impl Editor {
     }
 }
 
+/// Replace `path` atomically: write a sibling temp file, then rename it
+/// over the target — a crash mid-write leaves the old file intact
+/// instead of a truncated one. A new file ends up mode 0600 on Unix
+/// (bash creates its history file 0600 too — history carries secrets);
+/// an existing file's permissions are preserved across the rename.
+fn write_history_atomic(path: &std::path::Path, data: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let result = (|| {
+        let mut f = opts.open(&tmp)?;
+        // Keep a pre-existing history file's permissions; only a fresh
+        // file gets the restrictive default.
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = f.set_permissions(meta.permissions());
+        }
+        f.write_all(data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// One decoded input event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Key {
@@ -852,6 +912,8 @@ enum Key {
     AltBackspace, // ESC DEL — backward-kill-word
     Enter,
     Tab,
+    /// Shift-Tab (`CSI Z`, back-tab) — reverse menu cycling.
+    BackTab,
     Backspace,
     Delete,
     Up,
@@ -1023,6 +1085,9 @@ fn csi_key(params: &str, final_byte: u8) -> Key {
         ("3", b'~') => Key::Delete,
         ("5", b'~') => Key::PageUp,
         ("6", b'~') => Key::PageDown,
+        // Back-tab (Shift-Tab); some terminals send it with modifier
+        // parameters (`1;2Z`), hence the wildcard.
+        (_, b'Z') => Key::BackTab,
         _ => Key::Other,
     }
 }
@@ -1082,6 +1147,7 @@ static DEFAULT_BINDINGS: &[(Key, EditorAction)] = &[
     (Key::Ctrl('l'), EditorAction::ClearScreen),
     (Key::Ctrl('o'), EditorAction::OperateAndGetNext),
     (Key::Tab, EditorAction::Complete),
+    (Key::BackTab, EditorAction::MenuCompleteBackward),
     (Key::Ctrl('v'), EditorAction::QuotedInsert),
     (Key::Ctrl('q'), EditorAction::QuotedInsert),
 ];
@@ -1273,6 +1339,7 @@ fn key_spec(key: &Key) -> String {
         Key::AltBackspace => "\\M-\\C-?".to_string(),
         Key::Enter => "\\C-m".to_string(),
         Key::Tab => "\\C-i".to_string(),
+        Key::BackTab => "\\e[Z".to_string(),
         Key::Backspace => "\\C-?".to_string(),
         Key::Delete => "\\e[3~".to_string(),
         Key::Up => "\\e[A".to_string(),
@@ -1329,17 +1396,32 @@ fn read_key(hooks: &dyn Hooks) -> io::Result<Option<Key>> {
             // blocking the read indefinitely.
             match read_byte(hooks)? {
                 Some(b'[') => {
+                    // Per ECMA-48, a CSI body is parameter bytes
+                    // (0x30–0x3F: digits, `;`, and the private `< = > ?`)
+                    // then intermediates (0x20–0x2F), then one final byte
+                    // (0x40–0x7E). Consuming the whole grammar matters:
+                    // stopping at the first non-digit used to treat `<`
+                    // in an SGR mouse report (`ESC[<65;5;10M`) as the
+                    // final byte, leaking `65;5;10M` into the buffer as
+                    // typed text. Anything beyond the plain digits/`;`
+                    // subset is swallowed whole as `Key::Other`.
                     let mut params = String::new();
+                    let mut simple = true;
                     loop {
                         match read_byte_timeout(hooks, 50)? {
                             Some(c @ (b'0'..=b'9' | b';')) => params.push(c as char),
-                            Some(final_byte) => {
-                                if params == "200" && final_byte == b'~' {
+                            Some(0x20..=0x3f) => simple = false,
+                            Some(final_byte @ 0x40..=0x7e) => {
+                                if simple && params == "200" && final_byte == b'~' {
                                     return read_paste(hooks).map(Some);
                                 }
-                                return Ok(Some(csi_key(&params, final_byte)));
+                                return Ok(Some(if simple {
+                                    csi_key(&params, final_byte)
+                                } else {
+                                    Key::Other
+                                }));
                             }
-                            None => return Ok(Some(Key::Other)),
+                            _ => return Ok(Some(Key::Other)),
                         }
                     }
                 }
@@ -1384,16 +1466,36 @@ fn display_width(s: &str) -> usize {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            // Skip `ESC [ ... final` (or a lone two-char escape).
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for e in chars.by_ref() {
-                    if e.is_ascii_alphabetic() || e == '~' {
-                        break;
+            match chars.peek() {
+                // CSI: skip through the final byte (0x40–0x7E).
+                Some('[') => {
+                    chars.next();
+                    for e in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&e) {
+                            break;
+                        }
                     }
                 }
-            } else {
-                chars.next();
+                // OSC (window titles, OSC-8 hyperlinks): skip through
+                // the BEL or `ESC \` terminator — without this, a
+                // hyperlinked prompt had its whole URL counted as
+                // printable width, misplacing the cursor.
+                Some(']') => {
+                    chars.next();
+                    while let Some(e) = chars.next() {
+                        if e == '\x07' {
+                            break;
+                        }
+                        if e == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Any other two-char escape.
+                _ => {
+                    chars.next();
+                }
             }
             continue;
         }
@@ -1411,16 +1513,63 @@ fn display_width(s: &str) -> usize {
 fn visualize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        match c {
-            '\n' => out.push('⏎'),
-            '\t' => out.push_str("    "),
-            '\u{7f}' => out.push_str("^?"),
-            c if (c as u32) < 0x20 => {
-                out.push('^');
-                out.push(((c as u8) ^ 0x40) as char);
-            }
-            c => out.push(c),
+        push_vis_char(&mut out, c);
+    }
+    out
+}
+
+/// One character of [`visualize`]'s transform.
+#[cfg(unix)]
+fn push_vis_char(out: &mut String, c: char) {
+    match c {
+        '\n' => out.push('⏎'),
+        '\t' => out.push_str("    "),
+        '\u{7f}' => out.push_str("^?"),
+        c if (c as u32) < 0x20 => {
+            out.push('^');
+            out.push(((c as u8) ^ 0x40) as char);
         }
+        c => out.push(c),
+    }
+}
+
+/// [`visualize`], but passing complete SGR sequences (`ESC[…m`) through
+/// untouched — applied to [`Hooks::highlight`]'s output, so the host
+/// paints the *raw* buffer and the editor re-applies the control-char
+/// transform around the color markup. A non-SGR escape from the hook is
+/// visualized (`^[`) rather than sent to the terminal.
+#[cfg(unix)]
+fn visualize_keep_sgr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut body = String::new();
+            let mut fin = None;
+            for e in chars.by_ref() {
+                if e.is_ascii_digit() || e == ';' || e == ':' {
+                    body.push(e);
+                } else {
+                    fin = Some(e);
+                    break;
+                }
+            }
+            if fin == Some('m') {
+                out.push_str("\x1b[");
+                out.push_str(&body);
+                out.push('m');
+            } else {
+                // Not SGR: neutralize the ESC, keep the rest as text.
+                out.push_str("^[[");
+                out.push_str(&body);
+                if let Some(f) = fin {
+                    push_vis_char(&mut out, f);
+                }
+            }
+            continue;
+        }
+        push_vis_char(&mut out, c);
     }
     out
 }
@@ -1451,6 +1600,11 @@ struct LineState<'a> {
     /// left on — the starting point for the next repaint.
     painted_rows: usize,
     painted_cursor_row: usize,
+    /// The next render starts a brand-new region (first paint, after
+    /// C-l, a candidate list, a host binding…): the lines of a
+    /// multi-line prompt above its final line are printed then, and only
+    /// then — repaints touch just the final prompt line.
+    fresh_region: bool,
     /// History navigation: index into `history` (None = live line), the
     /// draft stashed when navigation started, and the anchored prefix for
     /// PageUp/PageDown prefix search.
@@ -1545,6 +1699,7 @@ fn read_line_raw(
         rprompt,
         painted_rows: 1,
         painted_cursor_row: 0,
+        fresh_region: true,
         hist_index: None,
         draft: String::new(),
         prefix: String::new(),
@@ -1787,7 +1942,11 @@ fn key_completes(key: &Key, bindings: &[(Key, Binding)], vi_normal: bool) -> boo
     };
     matches!(
         action,
-        Some(EditorAction::Complete | EditorAction::MenuComplete)
+        Some(
+            EditorAction::Complete
+                | EditorAction::MenuComplete
+                | EditorAction::MenuCompleteBackward
+        )
     )
 }
 
@@ -1832,6 +1991,7 @@ fn clear_screen(st: &mut LineState) {
     print!("\x1b[2J\x1b[H");
     st.painted_rows = 1;
     st.painted_cursor_row = 0;
+    st.fresh_region = true;
 }
 
 /// Wait for the next byte, honoring the `read_line_timeout` deadline and
@@ -1900,6 +2060,7 @@ fn run_host_binding(st: &mut LineState, raw: &RawMode, tag: &str) -> io::Result<
     }
     st.painted_rows = 1;
     st.painted_cursor_row = 0;
+    st.fresh_region = true;
     Ok(())
 }
 
@@ -2062,6 +2223,14 @@ fn run_action(
                 menu_complete_start(st)?;
             }
         }
+        EditorAction::MenuCompleteBackward => {
+            // Shift-Tab: step the cycle backward; cold, it starts on the
+            // *last* candidate (readline `menu-complete-backward`).
+            if st.menu.is_none() && !menu_arm(st)? {
+                return Ok(AfterKey::Done);
+            }
+            menu_step(st, true);
+        }
         EditorAction::QuotedInsert => quoted_insert(st)?,
     }
     Ok(AfterKey::Done)
@@ -2074,14 +2243,23 @@ fn run_action(
 /// not modeled (registers, `.` repeat, `/` search).
 #[cfg(unix)]
 fn handle_vi_normal(st: &mut LineState, key: Key, history: &[String], ring: &mut VecDeque<String>) {
-    // A pending `r`: the next character replaces the one under the cursor.
+    // A pending `r`: the next character replaces the `count` characters
+    // under the cursor (`3rx` → `xxx`); like vim, it fails outright when
+    // fewer than `count` remain.
     if st.vi_replace {
         st.vi_replace = false;
+        let n = st.vi_count.max(1);
         st.vi_count = 0;
-        if let Key::Char(c) = key
-            && let Some(next) = next_char_end(&st.buffer, st.cursor)
-        {
-            st.buffer.replace_range(st.cursor..next, &c.to_string());
+        if let Key::Char(c) = key {
+            let end = fwd_n(&st.buffer, st.cursor, n);
+            if st.buffer[st.cursor..end].chars().count() == n {
+                let replacement: String = std::iter::repeat_n(c, n).collect();
+                st.buffer.replace_range(st.cursor..end, &replacement);
+                // The cursor lands on the last replaced character.
+                st.cursor += c.len_utf8() * (n - 1);
+            } else {
+                let _ = bell(st.cfg.bell); // not enough characters left
+            }
         }
         return;
     }
@@ -2269,18 +2447,21 @@ fn handle_vi_normal(st: &mut LineState, key: Key, history: &[String], ring: &mut
             }
         }
         Key::Char('p') => {
-            if let Some(text) = ring.back().cloned()
+            // A count pastes that many copies (vim `3p`).
+            if let Some(text) = ring.back()
                 && !text.is_empty()
             {
+                let text = text.repeat(n);
                 let at = next_char_end(&st.buffer, st.cursor).unwrap_or(st.cursor);
                 st.buffer.insert_str(at, &text);
                 st.cursor = prev_char_start(&st.buffer, at + text.len()).unwrap_or(at);
             }
         }
         Key::Char('P') => {
-            if let Some(text) = ring.back().cloned()
+            if let Some(text) = ring.back()
                 && !text.is_empty()
             {
+                let text = text.repeat(n);
                 let at = st.cursor;
                 st.buffer.insert_str(at, &text);
                 st.cursor = prev_char_start(&st.buffer, at + text.len()).unwrap_or(at);
@@ -2444,6 +2625,7 @@ fn handle_search_key(
     key: Key,
     history: &[String],
 ) -> io::Result<SearchOutcome> {
+    let ci = st.cfg.search_ignore_case;
     let search = st.search.as_mut().expect("search active");
     match key {
         Key::Enter => {
@@ -2462,7 +2644,7 @@ fn handle_search_key(
             // Next older match.
             search.forward = false;
             let below = search.hit.unwrap_or(history.len());
-            let found = find_match(history, &search.query, below);
+            let found = find_match(history, &search.query, below, ci);
             search.failed = found.is_none() && !search.query.is_empty();
             search.hit = found.or(search.hit);
         }
@@ -2470,20 +2652,20 @@ fn handle_search_key(
             // Next newer match.
             search.forward = true;
             let above = search.hit.map(|h| h + 1).unwrap_or(0);
-            let found = find_match_fwd(history, &search.query, above);
+            let found = find_match_fwd(history, &search.query, above, ci);
             search.failed = found.is_none() && !search.query.is_empty();
             search.hit = found.or(search.hit);
         }
         Key::Backspace => {
             search.query.pop();
-            search.hit = find_match(history, &search.query, history.len());
+            search.hit = find_match(history, &search.query, history.len(), ci);
             search.failed = search.hit.is_none() && !search.query.is_empty();
         }
         Key::Char(c) => {
             search.query.push(c);
             // On a miss, keep showing the last match under the "failed"
             // label, like readline.
-            let found = find_match(history, &search.query, history.len());
+            let found = find_match(history, &search.query, history.len(), ci);
             search.failed = found.is_none();
             search.hit = found.or(search.hit);
         }
@@ -2504,26 +2686,51 @@ fn handle_search_key(
     Ok(SearchOutcome::Continue)
 }
 
+/// Substring match, optionally case-insensitive (readline 8.1's
+/// `search-ignore-case`).
+fn contains_match(hay: &str, needle: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        hay.to_lowercase().contains(&needle.to_lowercase())
+    } else {
+        hay.contains(needle)
+    }
+}
+
+/// Prefix match, optionally case-insensitive — the prefix-search twin of
+/// [`contains_match`].
+fn starts_with_match(hay: &str, prefix: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        hay.to_lowercase().starts_with(&prefix.to_lowercase())
+    } else {
+        hay.starts_with(prefix)
+    }
+}
+
 /// Most recent history entry (strictly before `below`) containing `query`.
 #[cfg(unix)]
-fn find_match(history: &[String], query: &str, below: usize) -> Option<usize> {
+fn find_match(history: &[String], query: &str, below: usize, ignore_case: bool) -> Option<usize> {
     if query.is_empty() {
         return None;
     }
     history[..below.min(history.len())]
         .iter()
-        .rposition(|h| h.contains(query))
+        .rposition(|h| contains_match(h, query, ignore_case))
 }
 
 /// Earliest history entry at or after `from` containing `query`.
 #[cfg(unix)]
-fn find_match_fwd(history: &[String], query: &str, from: usize) -> Option<usize> {
+fn find_match_fwd(
+    history: &[String],
+    query: &str,
+    from: usize,
+    ignore_case: bool,
+) -> Option<usize> {
     if query.is_empty() || from >= history.len() {
         return None;
     }
     history[from..]
         .iter()
-        .position(|h| h.contains(query))
+        .position(|h| contains_match(h, query, ignore_case))
         .map(|p| p + from)
 }
 
@@ -3095,6 +3302,7 @@ fn edit_in_editor(st: &mut LineState, raw: &RawMode) -> io::Result<Option<String
             // Editor failed or was declined: repaint on a fresh region.
             st.painted_rows = 1;
             st.painted_cursor_row = 0;
+            st.fresh_region = true;
             Ok(None)
         }
     }
@@ -3174,9 +3382,10 @@ fn history_prefix_prev(st: &mut LineState, history: &[String]) {
         st.draft = st.buffer.clone();
     }
     let below = st.hist_index.unwrap_or(history.len());
+    let ci = st.cfg.search_ignore_case;
     if let Some(i) = history[..below.min(history.len())]
         .iter()
-        .rposition(|h| h.starts_with(&st.prefix) && *h != st.buffer)
+        .rposition(|h| starts_with_match(h, &st.prefix, ci) && *h != st.buffer)
     {
         st.hist_index = Some(i);
         st.buffer = history[i].clone();
@@ -3190,9 +3399,10 @@ fn history_prefix_prev(st: &mut LineState, history: &[String]) {
 #[cfg(unix)]
 fn history_prefix_next(st: &mut LineState, history: &[String]) {
     let Some(cur) = st.hist_index else { return };
+    let ci = st.cfg.search_ignore_case;
     if let Some(off) = history[cur + 1..]
         .iter()
-        .position(|h| h.starts_with(&st.prefix))
+        .position(|h| starts_with_match(h, &st.prefix, ci))
     {
         let i = cur + 1 + off;
         st.hist_index = Some(i);
@@ -3241,6 +3451,7 @@ fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
         finish_line(st)?;
         st.painted_rows = 1;
         st.painted_cursor_row = 0;
+        st.fresh_region = true;
         // readline's completion-query-items: a big list asks first.
         if st.cfg.completion_query_items > 0 && candidates.len() >= st.cfg.completion_query_items {
             print!("Display all {} possibilities? (y or n)", candidates.len());
@@ -3299,9 +3510,20 @@ fn print_candidate_columns(candidates: &[Candidate]) {
 /// candidate list.
 #[cfg(unix)]
 fn menu_complete_start(st: &mut LineState) -> io::Result<()> {
+    if menu_arm(st)? {
+        menu_next(st);
+    }
+    Ok(())
+}
+
+/// Ask the host for candidates and arm the cycling state without
+/// stepping. `false` (after ringing the bell) when there are none.
+#[cfg(unix)]
+fn menu_arm(st: &mut LineState) -> io::Result<bool> {
     let (start, mut candidates) = st.hooks.complete(&st.buffer, st.cursor);
     if candidates.is_empty() {
-        return bell(st.cfg.bell);
+        bell(st.cfg.bell)?;
+        return Ok(false);
     }
     candidates.sort_by(|a, b| a.display.cmp(&b.display));
     st.menu = Some(MenuState {
@@ -3310,20 +3532,29 @@ fn menu_complete_start(st: &mut LineState) -> io::Result<()> {
         index: None,
         candidates,
     });
-    menu_next(st);
-    Ok(())
+    Ok(true)
 }
 
 /// A further Tab with the menu armed: replace the word with the next
 /// candidate, wrapping around the list.
 #[cfg(unix)]
 fn menu_next(st: &mut LineState) {
+    menu_step(st, false)
+}
+
+/// One step of the cycle, wrapping in either direction; a cold backward
+/// step starts on the last candidate.
+#[cfg(unix)]
+fn menu_step(st: &mut LineState, backward: bool) {
     let Some(mut menu) = st.menu.take() else {
         return;
     };
-    let i = match menu.index {
-        None => 0,
-        Some(i) => (i + 1) % menu.candidates.len(),
+    let len = menu.candidates.len();
+    let i = match (menu.index, backward) {
+        (None, false) => 0,
+        (None, true) => len - 1,
+        (Some(i), false) => (i + 1) % len,
+        (Some(i), true) => (i + len - 1) % len,
     };
     menu.index = Some(i);
     let replacement = &menu.candidates[i].replacement;
@@ -3407,12 +3638,14 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
     let cols = term_cols().max(2);
     let mut out = String::new();
 
-    // Return to the region's first row/column and clear everything below.
+    // Return to the region's first row/column. The old content is *not*
+    // cleared here: the new paint overwrites it in place and a trailing
+    // `ESC[J` erases whatever it left over — clear-then-paint showed a
+    // blank frame every keystroke (visible flicker on slow terminals).
     out.push('\r');
     if st.painted_cursor_row > 0 {
         out.push_str(&format!("\x1b[{}A", st.painted_cursor_row));
     }
-    out.push_str("\x1b[J");
 
     // Search mode paints its own prompt instead of PS1/buffer.
     if let Some(search) = &st.search {
@@ -3425,6 +3658,7 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
         };
         let line = format!("{label}`{}': {}", search.query, visualize(shown));
         out.push_str(&line);
+        out.push_str("\x1b[J");
         let w = display_width(&line);
         st.painted_rows = w / cols + 1;
         st.painted_cursor_row = w / cols;
@@ -3432,15 +3666,39 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
         return io::stdout().flush();
     }
 
+    // A multi-line prompt: everything up to the last newline is printed
+    // once per region (readline's approach) — only the final line is
+    // part of the per-keystroke repaint.
+    let (prompt_prefix, prompt_line) = match st.prompt.rsplit_once('\n') {
+        Some((prefix, last)) => (Some(prefix), last),
+        None => (None, st.prompt),
+    };
+    if st.fresh_region {
+        st.fresh_region = false;
+        if let Some(prefix) = prompt_prefix {
+            out.push_str(prefix);
+            out.push('\n');
+        }
+    }
+
     let vis = visualize(&st.buffer);
-    let highlighted = st.hooks.highlight(&vis);
+    // The host highlights the raw buffer (true text, true offsets); its
+    // SGR markup survives and everything else is re-visualized. A buffer
+    // holding a literal ESC is painted unhighlighted — hook markup and
+    // buffer bytes would be indistinguishable.
+    let highlighted = if st.buffer.contains('\x1b') {
+        vis.clone()
+    } else {
+        visualize_keep_sgr(&st.hooks.highlight(&st.buffer))
+    };
     let hint = if st.cursor == st.buffer.len() {
         visualize(&cached_hint(st, history).unwrap_or_default())
     } else {
         String::new()
     };
 
-    // readline's show-mode-in-prompt, with its default mode strings.
+    // readline's show-mode-in-prompt, with its default mode strings
+    // (prefixed to the prompt's final line).
     let mode = if !st.cfg.show_mode_in_prompt {
         ""
     } else if !st.vi {
@@ -3451,23 +3709,25 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
         "(ins)"
     };
 
-    let wp = display_width(mode) + display_width(st.prompt);
+    let wp = display_width(mode) + display_width(prompt_line);
     let wb = display_width(&vis);
     let wh = display_width(&hint);
     let wcursor = wp + display_width(&visualize(&st.buffer[..st.cursor]));
     let wtotal = wp + wb + wh;
 
     out.push_str(mode);
-    out.push_str(st.prompt);
+    out.push_str(prompt_line);
     out.push_str(&highlighted);
     if !hint.is_empty() {
         out.push_str(&format!("\x1b[2m{hint}\x1b[0m"));
     }
 
     // The right prompt: shown while everything fits on one row with
-    // a gap; hidden (zsh-style) once the line grows into it.
+    // a gap; hidden (zsh-style) once the line grows into it. Clear the
+    // gap first — the new content may be shorter than the old.
     let wr = display_width(st.rprompt);
     if wr > 0 && wtotal + wr + 1 < cols {
+        out.push_str("\x1b[K");
         out.push_str(&format!("\x1b[{}G", cols - wr + 1));
         out.push_str(st.rprompt);
     }
@@ -3477,6 +3737,10 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
     if wtotal > 0 && wtotal.is_multiple_of(cols) {
         out.push_str("\r\n");
     }
+
+    // Erase whatever the previous (possibly longer) paint left behind:
+    // the rest of this row and every row below the new content.
+    out.push_str("\x1b[J");
 
     let total_rows = wtotal / cols + 1;
     let end_row = wtotal / cols;
@@ -3515,6 +3779,7 @@ mod tests {
             rprompt: "",
             painted_rows: 1,
             painted_cursor_row: 0,
+            fresh_region: true,
             hist_index: None,
             draft: String::new(),
             prefix: String::new(),
@@ -4282,6 +4547,132 @@ mod tests {
         assert_eq!(st.buffer, "aXY\nZb");
         // And the normal-mode keymap itself never sees pastes as keys.
         handle_vi_normal(&mut st, Key::Char('u'), &history, &mut ring);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn back_tab_decodes_and_cycles_backward() {
+        assert_eq!(csi_key("", b'Z'), Key::BackTab);
+        assert_eq!(csi_key("1;2", b'Z'), Key::BackTab); // modifier params
+        assert_eq!(parse_key_spec("\\e[Z"), Some(Key::BackTab));
+        // A cold backward step starts on the *last* candidate and wraps.
+        let cand = |s: &str| Candidate {
+            display: s.to_string(),
+            replacement: s.to_string(),
+        };
+        let mut st = state("say al", 6);
+        st.menu = Some(MenuState {
+            start: 4,
+            inserted: 2,
+            index: None,
+            candidates: vec![cand("alpha"), cand("alphabet")],
+        });
+        menu_step(&mut st, true);
+        assert_eq!(st.buffer, "say alphabet");
+        menu_step(&mut st, true);
+        assert_eq!(st.buffer, "say alpha");
+        menu_step(&mut st, false); // and forward goes back again
+        assert_eq!(st.buffer, "say alphabet");
+    }
+
+    #[test]
+    fn display_width_skips_osc_sequences() {
+        // OSC-8 hyperlink, BEL-terminated: only "link" is visible.
+        assert_eq!(
+            display_width("\x1b]8;;http://example.com\x07link\x1b]8;;\x07"),
+            4
+        );
+        // OSC window title, ST-terminated.
+        assert_eq!(display_width("\x1b]0;title\x1b\\ab"), 2);
+        // CSI final bytes across the full 0x40–0x7E range still skip.
+        assert_eq!(display_width("\x1b[38;5;196mred\x1b[0m"), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn visualize_keep_sgr_passes_color_and_transforms_the_rest() {
+        // SGR passes through; tabs/newlines/control chars still render.
+        assert_eq!(
+            visualize_keep_sgr("\x1b[31mred\x1b[0m\ta\n"),
+            "\x1b[31mred\x1b[0m    a⏎"
+        );
+        // A non-SGR escape from a misbehaving hook is neutralized, not
+        // sent to the terminal.
+        assert_eq!(visualize_keep_sgr("\x1b[2J"), "^[[2J");
+        assert_eq!(visualize_keep_sgr("plain"), "plain");
+    }
+
+    #[test]
+    fn search_matchers_respect_ignore_case() {
+        assert!(contains_match("Echo Foo", "foo", true));
+        assert!(!contains_match("Echo Foo", "foo", false));
+        assert!(starts_with_match("Echo Foo", "echo", true));
+        assert!(!starts_with_match("Echo Foo", "echo", false));
+        #[cfg(unix)]
+        {
+            let history = vec!["Git Status".to_string()];
+            assert_eq!(find_match(&history, "git", history.len(), true), Some(0));
+            assert_eq!(find_match(&history, "git", history.len(), false), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vi_count_replace_and_paste() {
+        let history: Vec<String> = Vec::new();
+        let mut ring = VecDeque::new();
+        // 3rx replaces three characters; the cursor lands on the last.
+        let mut st = state("abcd", 0);
+        st.cfg.bell = BellStyle::None;
+        for key in ['3', 'r', 'x'] {
+            handle_vi_normal(&mut st, Key::Char(key), &history, &mut ring);
+        }
+        assert_eq!(st.buffer, "xxxd");
+        assert_eq!(st.cursor, 2);
+        // Fewer than count characters left: fails outright, like vim.
+        let mut st = state("ab", 0);
+        st.cfg.bell = BellStyle::None;
+        for key in ['3', 'r', 'x'] {
+            handle_vi_normal(&mut st, Key::Char(key), &history, &mut ring);
+        }
+        assert_eq!(st.buffer, "ab");
+        // 3p pastes three copies after the cursor character.
+        let mut ring = VecDeque::from(vec!["xy".to_string()]);
+        let mut st = state("ab", 0);
+        for key in ['3', 'p'] {
+            handle_vi_normal(&mut st, Key::Char(key), &history, &mut ring);
+        }
+        assert_eq!(st.buffer, "axyxyxyb");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_file_is_private_and_replaced_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("rusty_lines_perm_test_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut ed = Editor::new();
+        ed.add_history_entry("secret");
+        ed.save_history(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "new history file must be 0600");
+        // No temp file left behind.
+        let tmp = format!("{}.tmp.{}", path.display(), std::process::id());
+        assert!(!std::path::Path::new(&tmp).exists());
+        // An existing file keeps its (deliberately laxer) permissions.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ed.add_history_entry("more");
+        ed.save_history(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "existing permissions preserved");
+        // append_history's create path is 0600 too.
+        let _ = std::fs::remove_file(&path);
+        ed.add_history_entry("tail");
+        ed.append_history(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(unix)]
