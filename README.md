@@ -43,6 +43,21 @@ Try it: `cargo run --example demo` — or `hooked` (completion, hints,
 host bindings), `vi` (vi mode + mode indicator), `rprompt`,
 `initial`, and `timeout`.
 
+## Benchmarks
+
+`bench/` is a standalone (non-workspace, non-published) harness that
+drives rusty_lines, rustyline, and reedline side by side under a real
+pseudo-terminal with identical byte streams — per-keystroke latency,
+burst throughput, paste ingestion, history navigation, and bytes
+painted per keystroke (what a slow ssh link pays for):
+
+```sh
+cd bench && cargo run --release
+```
+
+It is deliberately not a workspace member so the editor itself stays
+dependency-free; the harness pulls in the competitors on demand.
+
 ## Feature matrix
 
 The feature set was audited against the line editors in wide use — GNU
