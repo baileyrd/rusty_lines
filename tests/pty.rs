@@ -438,6 +438,56 @@ fn read_line_with_initial_seeds_buffer_and_cursor() {
 }
 
 #[test]
+fn rprompt_paints_and_hides_when_the_line_grows_into_it() {
+    // The rprompt example paints "RIGHT" at the row's right edge while
+    // the line is short, and hides it (zsh-style) once the buffer grows
+    // into it: at 80 columns, prompt "rp> " (4) + 72 chars + gap leaves
+    // no room for the 5-wide rprompt.
+    let (master, mut child) = spawn_example("rprompt");
+    let mut m = std::fs::File::from(master.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    loop {
+        if strip_ansi(&out).contains("RIGHT") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rprompt never painted:\n{}",
+            strip_ansi(&out)
+        );
+        drain(&master, &mut out, 100);
+    }
+    let long = "a".repeat(72);
+    m.write_all(long.as_bytes()).unwrap();
+    m.write_all(b"\r").unwrap();
+    m.flush().unwrap();
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "rprompt demo did not exit");
+    }
+    child.wait().unwrap();
+    drain(&master, &mut out, 200);
+    let out = strip_ansi(&out);
+    assert!(out.contains(&echo(&long)), "line mangled:\n{out}");
+    // Repaint rows are separated by \r; any row holding the full-length
+    // buffer must no longer carry the rprompt.
+    let full_rows: Vec<&str> = out.split('\r').filter(|seg| seg.contains(&long)).collect();
+    assert!(
+        !full_rows.is_empty(),
+        "no full-length repaint captured:\n{out}"
+    );
+    for row in full_rows {
+        assert!(
+            !row.contains("RIGHT"),
+            "rprompt not hidden on a full row: {row:?}"
+        );
+    }
+}
+
+#[test]
 fn read_line_timeout_expires_at_the_prompt() {
     // Sit at the timeout example's prompt without typing: the 2s deadline
     // must fire, print bash's message, and exit cleanly.

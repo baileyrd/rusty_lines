@@ -55,7 +55,7 @@ full per-editor survey behind this table is in
 | Pre-seeded lines: `read_line_with_initial((left, right))` starts the edit with text in the buffer and the cursor between the halves — `fc`-style edit-and-rerun, offered corrections | rustyline `readline_with_initial`, zsh `print -z` |
 | Word flavors: M-b/M-f/M-d/M-Backspace use alphanumeric words, C-w whitespace words (unix-word-rubout) | readline's two word classes |
 | Ctrl-arrow / Alt-arrow word motion (`CSI 1;5C` etc.) | every modern terminal editor |
-| Undo: C-_ , C-x C-u (and C-z, fish-style); runs of self-insert undo in groups of at most 20 characters (readline's chunking); M-r reverts the whole line | readline (incl. `revert-line`), ZLE, fish |
+| Undo: C-_ , C-x C-u (and C-z, fish-style); runs of self-insert *and of single-character deletes* undo in groups of at most 20 characters (readline's chunking); M-r reverts the whole line | readline (incl. `revert-line`), ZLE, fish |
 | Transpose: C-t chars (two-before at EOL), M-t words | readline |
 | Case ops: M-u / M-l / M-c | readline, ZLE |
 | Insert last argument: M-. / M-_ , repeat cycles older entries | readline, ZLE |
@@ -130,8 +130,9 @@ either niche, terminal-hostile, or a different program's job:
   right would add a segmentation dependency while terminals themselves
   disagree on cluster widths, so the common-case behavior is kept.
 - **Non-tty / non-Unix**: a piped stdin *or* stdout gets a plain line
-  read (there is nothing to repaint on a pipe); non-Unix builds get a
-  buffered prompt-and-read.
+  read (there is nothing to repaint on a pipe); when stdin is still a
+  terminal, the prompt goes to stderr, bash's rule, so the user sees
+  where to type. Non-Unix builds get a buffered prompt-and-read.
 
 ## Verification
 
