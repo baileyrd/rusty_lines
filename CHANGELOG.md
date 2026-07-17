@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- New `bench/` head-to-head benchmark harness: a standalone,
+  non-workspace crate that spawns minimal rusty_lines, rustyline, and
+  reedline REPLs under one pty driver (which answers cursor-position
+  queries, required by reedline) and feeds identical byte streams —
+  measuring paced per-keystroke latency, burst throughput, bytes
+  painted per key, 20 KB paste ingestion, and history-arrow cost.
+  Deliberately outside the workspace so the editor keeps its
+  zero-dependency build; run with `cd bench && cargo run --release`.
+
 - In-session history edits survive navigation: change a recalled entry,
   move away with Up/Down/M-</M->/prefix search/vi `G`, come back — the
   edit is still there (zsh's scope: everything reverts once a line is
