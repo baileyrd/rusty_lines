@@ -327,6 +327,48 @@ fn host_binding_rewrites_the_line() {
 }
 
 #[test]
+fn burst_ending_in_host_binding_paints_correctly() {
+    // "abc" + C-g delivered in ONE write (one pty read on the editor's
+    // side): the self-inserts coalesce their repaints, and the host
+    // binding — reached via a call nested inside run_action, not the
+    // main loop — must still see a freshly painted, uncorrupted
+    // terminal when it suspends raw mode. A stale paint here would
+    // desync `finish_line`'s cursor math and corrupt the display.
+    let out = run_session_in("hooked", "hooked> ", &[b"abc\x07", b"\r"]);
+    assert!(
+        out.contains(&echo("ABC")),
+        "burst-then-host-binding corrupted:\n{out}"
+    );
+}
+
+#[test]
+fn burst_ending_in_tab_completion_paints_correctly() {
+    // "al" + Tab in one write: the completion candidate list is printed
+    // by a function nested inside run_action (list_candidates), which
+    // also must see a fresh paint, not a coalesced/stale one.
+    let out = run_session_in("hooked", "hooked> ", &[b"al\t", b"\r"]);
+    assert!(
+        out.contains(&echo("alpha")),
+        "burst-then-completion corrupted:\n{out}"
+    );
+}
+
+#[test]
+fn long_burst_into_enter_paints_correctly() {
+    // A long run of coalesced self-inserts (many skipped repaints in a
+    // row) immediately followed by Enter in the same write: the final
+    // `finish_line` must flush the whole deferred run, not just the
+    // last key, before computing its cursor-movement math.
+    let line = "x".repeat(300);
+    let chunk = format!("{line}\r");
+    let out = run_session(&[chunk.as_bytes()]);
+    assert!(
+        out.contains(&echo(&line)),
+        "long coalesced burst lost or corrupted text"
+    );
+}
+
+#[test]
 fn character_search_moves_to_the_typed_char() {
     // C-a to column 0, C-] then 'l' jumps onto the first 'l', C-d
     // deletes it (readline character-search).

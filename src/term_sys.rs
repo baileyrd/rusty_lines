@@ -121,17 +121,20 @@ mod imp {
         }
     }
 
-    /// Read one byte from stdin: `Ok(Some(b))`, `Ok(None)` at EOF, or an
-    /// error (whose `ErrorKind` is correct, e.g. `Interrupted` on `EINTR`).
-    pub fn read_stdin_byte() -> io::Result<Option<u8>> {
-        let mut b = [0u8; 1];
-        // SAFETY: writing at most one byte into a one-byte buffer.
-        let n = unsafe { libc::read(0, b.as_mut_ptr().cast(), 1) };
-        match n {
-            0 => Ok(None),
-            1 => Ok(Some(b[0])),
-            _ => Err(io::Error::last_os_error()),
+    /// Read up to `buf.len()` bytes from stdin in one syscall: `Ok(0)` at
+    /// EOF, `Ok(n)` for `n` bytes read (may be less than `buf.len()` —
+    /// a single `read` on a tty returns whatever the kernel line
+    /// discipline currently has queued, which is exactly what the
+    /// caller's userspace buffer should hold). Lets a caller collecting
+    /// many bytes (a paste, a burst of escape sequences) pay one syscall
+    /// instead of one per byte.
+    pub fn read_stdin_chunk(buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: writing at most `buf.len()` bytes into `buf`.
+        let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
         }
+        Ok(n as usize)
     }
 
     /// Terminal width in columns from stdout, if available and non-zero.
@@ -239,15 +242,11 @@ mod imp {
         }
     }
 
-    /// Read one byte from stdin: `Ok(Some(b))`, `Ok(None)` at EOF, or an
-    /// error (whose `ErrorKind` is correct, e.g. `Interrupted` on `EINTR`).
-    pub fn read_stdin_byte() -> io::Result<Option<u8>> {
-        let mut b = [0u8; 1];
-        match fd::read(0, &mut b) {
-            Ok(0) => Ok(None),
-            Ok(_) => Ok(Some(b[0])),
-            Err(e) => Err(to_io(e)),
-        }
+    /// Read up to `buf.len()` bytes from stdin in one syscall (see the
+    /// libc backend for the rationale — one read call instead of one per
+    /// byte when collecting a paste or a burst of escape sequences).
+    pub fn read_stdin_chunk(buf: &mut [u8]) -> io::Result<usize> {
+        fd::read(0, buf).map_err(to_io)
     }
 
     /// Terminal width in columns from stdout, if available and non-zero.

@@ -1306,22 +1306,67 @@ impl Drop for BracketedPaste {
     }
 }
 
-/// Whether fd 0 has a byte ready within `ms` milliseconds — the lone-ESC
-/// vs escape-sequence disambiguation.
 #[cfg(unix)]
-fn input_ready(ms: i32) -> bool {
-    term_sys::poll_stdin(ms)
+thread_local! {
+    /// Bytes already pulled from fd 0 by one `read_stdin_chunk` call but
+    /// not yet handed to the decoder. `read_byte` refills this with a
+    /// single syscall reading whatever the kernel currently has queued,
+    /// instead of one syscall per byte — the difference between ~1 and
+    /// ~20,000 syscalls for a 20 KB paste. Thread-local (not
+    /// per-`Editor`) because it holds real undelivered bytes from the
+    /// fd, which must survive exactly as long as the fd's read position
+    /// does — including across separate `read_line` calls, when a burst
+    /// of typing outruns processing.
+    static STDIN_BUF: std::cell::RefCell<(Vec<u8>, usize)> =
+        const { std::cell::RefCell::new((Vec::new(), 0)) };
 }
 
-/// One byte straight off fd 0 — deliberately *not* through
-/// `io::stdin()`, whose userspace buffer would swallow the rest of an
-/// escape sequence and make `input_ready`'s `poll` lie about it (the
-/// arrow keys literally didn't work through the buffered reader).
+/// Whether fd 0 has a byte ready within `ms` milliseconds — the lone-ESC
+/// vs escape-sequence disambiguation. Bytes already sitting in
+/// [`STDIN_BUF`] count as ready with no syscall; this is what must agree
+/// with `read_byte`'s buffer, or the lone-ESC poll would lie exactly the
+/// way `io::Stdin`'s hidden buffer used to (see `read_byte`).
+#[cfg(unix)]
+fn input_ready(ms: i32) -> bool {
+    let buffered = STDIN_BUF.with(|b| {
+        let (data, pos) = &*b.borrow();
+        *pos < data.len()
+    });
+    buffered || term_sys::poll_stdin(ms)
+}
+
+/// One byte off fd 0, served from [`STDIN_BUF`] when it has one, else
+/// refilled by a single `read` syscall — deliberately *not* through
+/// `io::stdin()`, whose *own* userspace buffer would swallow the rest of
+/// an escape sequence and make `input_ready`'s `poll` lie about it (the
+/// arrow keys literally didn't work through the buffered reader). The
+/// difference here is that this buffer *is* what `input_ready` consults,
+/// so the two can never disagree the way `io::Stdin`'s opaque one did.
 #[cfg(unix)]
 fn read_byte(hooks: &dyn Hooks) -> io::Result<Option<u8>> {
+    if let Some(b) = STDIN_BUF.with(|b| {
+        let (data, pos) = &mut *b.borrow_mut();
+        (*pos < data.len()).then(|| {
+            let b = data[*pos];
+            *pos += 1;
+            b
+        })
+    }) {
+        return Ok(Some(b));
+    }
     loop {
-        match term_sys::read_stdin_byte() {
-            Ok(outcome) => return Ok(outcome),
+        let mut chunk = [0u8; 4096];
+        match term_sys::read_stdin_chunk(&mut chunk) {
+            Ok(0) => return Ok(None), // EOF
+            Ok(n) => {
+                return Ok(STDIN_BUF.with(|b| {
+                    let (data, pos) = &mut *b.borrow_mut();
+                    data.clear();
+                    data.extend_from_slice(&chunk[..n]);
+                    *pos = 1;
+                    Some(chunk[0])
+                }));
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                 // A signal (e.g. a deferred TERM) landed mid-read; let
                 // trap machinery see it at the next safe point and
@@ -1987,6 +2032,15 @@ struct LineState<'a> {
     /// multi-line prompt above its final line are printed then, and only
     /// then — repaints touch just the final prompt line.
     fresh_region: bool,
+    /// A repaint was skipped because more input was already queued
+    /// (readline's coalescing trick — see the main loop's bottom): the
+    /// skipped frame would be instantly overwritten by the very next
+    /// key's repaint, so painting it is pure waste while a burst is
+    /// draining. `finish_line` flushes this before its cursor math runs
+    /// — that math assumes the terminal's physical cursor sits exactly
+    /// where `painted_rows`/`painted_cursor_row` say, which is only true
+    /// immediately after a real (unskipped) render.
+    render_owed: bool,
     /// History navigation: index into `history` (None = live line), the
     /// draft stashed when navigation started, and the anchored prefix for
     /// PageUp/PageDown prefix search.
@@ -2114,6 +2168,7 @@ fn read_line_raw(
         painted_rows: 1,
         painted_cursor_row: 0,
         fresh_region: true,
+        render_owed: false,
         hist_index: None,
         draft: String::new(),
         prefix: String::new(),
@@ -2168,7 +2223,7 @@ fn read_line_raw(
             if let Some(d) = deadline
                 && std::time::Instant::now() >= d
             {
-                finish_line(&mut st)?;
+                finish_line(&mut st, history)?;
                 return Ok(ReadResult::TimedOut);
             }
             if input_ready(200) {
@@ -2191,11 +2246,13 @@ fn read_line_raw(
                 st.fresh_region = true;
                 writeln!(io::stdout())?;
                 render(&mut st, history)?;
+                st.render_owed = false; // just painted for real
             }
             let now = term_cols();
             if now != cols {
                 cols = now;
                 render(&mut st, history)?;
+                st.render_owed = false; // just painted for real
             }
         }
 
@@ -2204,7 +2261,7 @@ fn read_line_raw(
             // returned rather than discarded — readline's rule, and what
             // the piped-stdin path already does; only an empty line is
             // end-of-input.
-            finish_line(&mut st)?;
+            finish_line(&mut st, history)?;
             return Ok(if st.buffer.is_empty() {
                 ReadResult::Eof
             } else {
@@ -2220,11 +2277,11 @@ fn read_line_raw(
                     continue;
                 }
                 SearchOutcome::Accept => {
-                    finish_line(&mut st)?;
+                    finish_line(&mut st, history)?;
                     return Ok(ReadResult::Line(st.buffer));
                 }
                 SearchOutcome::Interrupt => {
-                    finish_line(&mut st)?;
+                    finish_line(&mut st, history)?;
                     return Ok(ReadResult::Interrupted);
                 }
             }
@@ -2314,7 +2371,7 @@ fn read_line_raw(
                 key => match bindings.iter().find(|(k, _)| *k == key) {
                     Some((_, Binding::Unbound)) => AfterKey::Done,
                     Some((_, Binding::Host(tag))) => {
-                        run_host_binding(&mut st, &raw, tag)?;
+                        run_host_binding(&mut st, &raw, tag, history)?;
                         AfterKey::Done
                     }
                     Some((_, Binding::Action(action))) => {
@@ -2331,7 +2388,7 @@ fn read_line_raw(
         match after {
             AfterKey::Done => {}
             AfterKey::Accept => {
-                finish_line(&mut st)?;
+                finish_line(&mut st, history)?;
                 return Ok(ReadResult::Line(st.buffer));
             }
             AfterKey::AcceptAndRecall => {
@@ -2340,19 +2397,19 @@ fn read_line_raw(
                 *next_recall = st
                     .hist_index
                     .and_then(|i| history.get(i + 1).map(|e| (i + 1, e.clone())));
-                finish_line(&mut st)?;
+                finish_line(&mut st, history)?;
                 return Ok(ReadResult::Line(st.buffer));
             }
             AfterKey::Interrupted => {
-                finish_line(&mut st)?;
+                finish_line(&mut st, history)?;
                 return Ok(ReadResult::Interrupted);
             }
             AfterKey::Eof => {
-                finish_line(&mut st)?;
+                finish_line(&mut st, history)?;
                 return Ok(ReadResult::Eof);
             }
             AfterKey::External => {
-                if let Some(line) = edit_in_editor(&mut st, &raw)? {
+                if let Some(line) = edit_in_editor(&mut st, &raw, history)? {
                     return Ok(ReadResult::Line(line));
                 }
             }
@@ -2361,7 +2418,21 @@ fn read_line_raw(
         record_undo(&mut st, snapshot);
         st.prev_action = st.this_action;
 
-        render(&mut st, history)?;
+        // Coalesce repaints while more input is already queued
+        // (readline's trick): a skipped frame would be instantly
+        // overwritten by the next key's repaint anyway.
+        // `input_ready(0)` is a zero-timeout poll — free when
+        // `STDIN_BUF` already has bytes buffered, so this never delays
+        // draining a burst — and `render_owed` guarantees the next
+        // `finish_line` (Enter, C-c, a completion listing, a host
+        // binding, …) forces one fresh paint first, so its
+        // cursor-position math is never stale.
+        if input_ready(0) {
+            st.render_owed = true;
+        } else {
+            render(&mut st, history)?;
+            st.render_owed = false;
+        }
     }
 }
 
@@ -2393,7 +2464,17 @@ fn record_undo(st: &mut LineState, snapshot: (String, usize)) {
 /// Move to the end of the painted region and start a fresh terminal line,
 /// so whatever runs next begins below the edit region.
 #[cfg(unix)]
-fn finish_line(st: &mut LineState) -> io::Result<()> {
+fn finish_line(st: &mut LineState, history: &[String]) -> io::Result<()> {
+    // The "move down to the end of the region" math below trusts
+    // `painted_rows`/`painted_cursor_row` to describe exactly where the
+    // terminal's physical cursor is — true only right after a render
+    // that actually wrote. A coalesced burst may have deferred that
+    // write; catch up here, in the one place every exit path funnels
+    // through, so no call site can forget it.
+    if st.render_owed {
+        render(st, history)?;
+        st.render_owed = false;
+    }
     let down = st.painted_rows.saturating_sub(1 + st.painted_cursor_row);
     let mut out = io::stdout().lock();
     if down > 0 {
@@ -2540,8 +2621,13 @@ fn bell(style: BellStyle) -> io::Result<()> {
 /// host (bash's `bind -x`, `READLINE_LINE`/`READLINE_POINT`), take back
 /// whatever it wrote, and repaint on a fresh region.
 #[cfg(unix)]
-fn run_host_binding(st: &mut LineState, raw: &RawMode, tag: &str) -> io::Result<()> {
-    finish_line(st)?;
+fn run_host_binding(
+    st: &mut LineState,
+    raw: &RawMode,
+    tag: &str,
+    history: &[String],
+) -> io::Result<()> {
+    finish_line(st, history)?;
     raw.suspend();
     let mut line = std::mem::take(&mut st.buffer);
     let mut cursor = st.cursor;
@@ -2710,7 +2796,7 @@ fn run_action(
             } else if st.cfg.menu_complete {
                 menu_complete_start(st)?;
             } else {
-                complete_at_cursor(st)?;
+                complete_at_cursor(st, history)?;
             }
         }
         EditorAction::MenuComplete => {
@@ -2736,7 +2822,7 @@ fn run_action(
                 bell(st.cfg.bell)?;
             } else {
                 candidates.sort_by(|a, b| a.display.cmp(&b.display));
-                list_candidates(st, &candidates)?;
+                list_candidates(st, &candidates, history)?;
             }
         }
         EditorAction::InsertCompletions => {
@@ -3908,9 +3994,13 @@ fn create_edit_tempfile(contents: &str) -> io::Result<std::path::PathBuf> {
 }
 
 #[cfg(unix)]
-fn edit_in_editor(st: &mut LineState, raw: &RawMode) -> io::Result<Option<String>> {
+fn edit_in_editor(
+    st: &mut LineState,
+    raw: &RawMode,
+    history: &[String],
+) -> io::Result<Option<String>> {
     let path = create_edit_tempfile(&st.buffer)?;
-    finish_line(st)?;
+    finish_line(st, history)?;
     raw.suspend();
     let editor = st
         .hooks
@@ -4090,7 +4180,7 @@ fn history_prefix_next(st: &mut LineState, history: &[String]) {
 /// candidate list below the line and arm menu cycling, so further Tabs
 /// walk the candidates in-line (zsh `AUTO_MENU`).
 #[cfg(unix)]
-fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
+fn complete_at_cursor(st: &mut LineState, history: &[String]) -> io::Result<()> {
     let (start, mut candidates) = st.hooks.complete(&st.buffer, st.cursor);
     let start = clamp_start(&st.buffer, start, st.cursor);
     if candidates.is_empty() {
@@ -4127,7 +4217,7 @@ fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
     if progressed && !st.cfg.show_all_if_ambiguous {
         return Ok(());
     }
-    if list_candidates(st, &candidates)? {
+    if list_candidates(st, &candidates, history)? {
         st.menu = Some(MenuState {
             start,
             inserted: st.cursor - start,
@@ -4142,9 +4232,13 @@ fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
 /// `completion-query-items` question when it's big). `false` when the
 /// user declined or the deadline passed — nothing was listed.
 #[cfg(unix)]
-fn list_candidates(st: &mut LineState, candidates: &[Candidate]) -> io::Result<bool> {
+fn list_candidates(
+    st: &mut LineState,
+    candidates: &[Candidate],
+    history: &[String],
+) -> io::Result<bool> {
     // The next render starts a fresh region below whatever gets printed.
-    finish_line(st)?;
+    finish_line(st, history)?;
     st.painted_rows = 1;
     st.painted_cursor_row = 0;
     st.fresh_region = true;
@@ -4480,6 +4574,7 @@ mod tests {
             painted_rows: 1,
             painted_cursor_row: 0,
             fresh_region: true,
+            render_owed: false,
             hist_index: None,
             draft: String::new(),
             prefix: String::new(),

@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Performance: two fixes driven by `bench/`'s numbers, both internal
+  (no API or behavior change; the pty test suite gained several tests
+  targeting the exact hazard the second one had to avoid).
+  - **Buffered stdin reads**: `read_byte` used to cost one `read()`
+    syscall per byte (via `term_sys::read_stdin_byte`); it now pulls
+    whatever the kernel has queued in one `read_stdin_chunk` call and
+    serves individual bytes from an internal buffer, refilling only
+    when it empties. `input_ready` consults the same buffer, so it can
+    never disagree with `read_byte` about what's pending (the same
+    hazard `io::Stdin`'s own opaque buffering caused historically — see
+    `read_byte`'s doc comment). This fixed the benchmark's worst gap: a
+    20 KB bracketed paste went from ~29ms to ~2ms, on par with
+    rustyline and reedline (both were previously 10-15x faster here).
+  - **Repaint coalescing**: the main loop now skips a repaint when more
+    input is already queued (`input_ready(0)`, free when the stdin
+    buffer above has bytes) — a skipped frame would be instantly
+    overwritten by the next key's repaint anyway, readline's own
+    trick. A new `render_owed` flag on `LineState` guarantees this is
+    safe: `finish_line` (the single choke point every exit path —
+    Enter, C-c, a completion listing, a host binding, C-x C-e — now
+    funnels through) flushes any owed render *before* computing its
+    cursor-repositioning math, which would otherwise corrupt the
+    display if it ran against stale `painted_rows`/`painted_cursor_row`
+    bookkeeping. This took burst-typing throughput from ~19µs/key to
+    ~0.7µs/key and cut bytes written per keystroke at a long line from
+    ~1100 to ~6 — both now favorable versus rustyline — with zero
+    change to true per-keystroke (paced) latency, since normal
+    interactive typing never has anything queued to coalesce.
+
 - New `bench/` head-to-head benchmark harness: a standalone,
   non-workspace crate that spawns minimal rusty_lines, rustyline, and
   reedline REPLs under one pty driver (which answers cursor-position
