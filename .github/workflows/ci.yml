@@ -19,8 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable
-      - run: cargo build --all-targets
-      - run: cargo test
+      - run: cargo build --locked --all-targets
+      - run: cargo test --locked
 
   windows-check:
     # The non-Unix fallback path is a plain buffered read; make sure it
@@ -30,8 +30,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable
-      - run: cargo check --all-targets
-      - run: cargo test
+      - run: cargo check --locked --all-targets
+      - run: cargo test --locked
 
   libc-backend:
     # rusty_libc is the default backend on Linux, so the plain test job
@@ -42,8 +42,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable && rustup component add clippy
-      - run: cargo test --no-default-features --features libc-backend
-      - run: cargo clippy --all-targets --no-default-features --features libc-backend -- -D warnings
+      - run: cargo test --locked --no-default-features --features libc-backend
+      - run: cargo clippy --locked --all-targets --no-default-features --features libc-backend -- -D warnings
 
   lint:
     name: Clippy + rustfmt
@@ -51,9 +51,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable && rustup component add clippy rustfmt
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo fmt --check
-      - run: cargo doc --no-deps
+      - run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -63,4 +63,4 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install 1.88 --profile minimal && rustup default 1.88
-      - run: cargo check --all-targets
+      - run: cargo check --locked --all-targets
