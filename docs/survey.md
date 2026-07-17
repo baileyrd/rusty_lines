@@ -47,7 +47,11 @@ psql, and hundreds of others link it.
   8.1's `search-ignore-case`, `menu-complete-backward` (Shift-Tab),
   multi-line prompt handling (prefix lines print once, the final line
   repaints), the 0600 history file, bash's `HISTCONTROL=ignorespace`,
-  and the read timeout (`rl_set_timeout`, bash `$TMOUT`).
+  `possible-completions` (M-?) and `insert-completions` (M-*),
+  `character-search` (C-]), the completion append character, the
+  20-character self-insert undo chunking, point landing on the match
+  when a search ends, and the read timeout (`rl_set_timeout`, bash
+  `$TMOUT`).
 - **Declined:** `.inputrc` *file parsing* (the host's `bind` builtin
   passes readline key specs through instead); multi-key chord bindings
   beyond the built-in C-x set; keyboard macros (C-x `(` … C-x `)`);
@@ -182,7 +186,7 @@ the README; kept in both places deliberately.)
 | Operate-and-get-next: C-o accepts the line and pre-loads the next `read_line` with the history entry after it, for replaying command sequences | readline `operate-and-get-next`, bash |
 | Word flavors: M-b/M-f/M-d/M-Backspace use alphanumeric words, C-w whitespace words (unix-word-rubout) | readline's two word classes |
 | Ctrl-arrow / Alt-arrow word motion (`CSI 1;5C` etc.) | every modern terminal editor |
-| Undo: C-_ , C-x C-u (and C-z, fish-style); runs of self-insert undo as one unit; M-r reverts the whole line | readline (incl. `revert-line`), ZLE, fish |
+| Undo: C-_ , C-x C-u (and C-z, fish-style); runs of self-insert undo in groups of at most 20 characters (readline's chunking); M-r reverts the whole line | readline (incl. `revert-line`), ZLE, fish |
 | Transpose: C-t chars (two-before at EOL), M-t words | readline |
 | Case ops: M-u / M-l / M-c | readline, ZLE |
 | Insert last argument: M-. / M-_ , repeat cycles older entries | readline, ZLE |
@@ -194,20 +198,22 @@ the README; kept in both places deliberately.)
 | History ignore-space option: `set_history_ignore_space` skips lines starting with a space | bash `HISTCONTROL=ignorespace`, zsh `HIST_IGNORE_SPACE` |
 | History persistence: `save_history` rewrites atomically (temp file + rename) and creates the file mode 0600, `append_history` appends only new entries; `load_history` tolerates a rustyline `#V2` header | bash `histappend` and its 0600 history file; rustyline migration |
 | Clear screen: C-l clears and repaints the edit region at the top | readline `clear-screen` |
-| Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search; a miss shows `(failed reverse-i-search)` and rings the bell, keeping the last match visible | readline, ZLE |
+| Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search; a miss shows `(failed reverse-i-search)` and rings the bell, keeping the last match visible; leaving the search puts the cursor *on* the match (readline's point) | readline, ZLE |
 | Case-insensitive search option: `set_search_ignore_case` covers incremental *and* prefix search | readline 8.1 `search-ignore-case` |
 | Bell on failed operations: no-match completion, history past either end, failed prefix search, failed vi find — all per `set_bell_style` | readline `bell-style` |
-| Prefix history search: PageUp/PageDown, M-p/M-n | ZLE `history-beginning-search`, fish Up, PSReadLine |
+| Prefix history search: PageUp/PageDown, M-p/M-n; the prefix re-anchors on the buffer up to the cursor whenever the previous key wasn't a prefix search | ZLE `history-beginning-search`, fish Up, PSReadLine |
 | History hints (autosuggestions) via `Hooks::hint`, Right/End accepts; M-f / Ctrl-Right at end of line accepts one word | fish, PSReadLine, linenoise hints |
 | Syntax highlighting while typing via `Hooks::highlight`: the hook paints the *raw* buffer (true text, true byte offsets); its SGR markup passes through and the editor re-applies control-char visualization around it | fish, ZLE plugins, replxx |
-| Tab completion via `Hooks::complete`: LCP insertion + sorted, column-major candidate list; big lists ask `Display all N possibilities? (y or n)` first (`set_completion_query_items`, default 100) | readline `CompletionType::List`, `completion-query-items` |
+| Tab completion via `Hooks::complete`: LCP insertion + sorted, column-major candidate list; big lists ask `Display all N possibilities? (y or n)` first (`set_completion_query_items`, default 100); a unique match gets the append character — a space by default (`set_completion_append_character`) | readline `CompletionType::List`, `completion-query-items`, `rl_completion_append_character` |
 | Menu cycling: Tab after the candidate list walks the candidates in-line, wrapping around; Shift-Tab (`CSI Z`) cycles backward, starting from the last candidate | zsh `AUTO_MENU` / `reverse-menu-complete`, readline `menu-complete(-backward)` |
+| `possible-completions` (M-?) lists the candidates without editing the buffer; `insert-completions` (M-*) inserts every match, space-separated | readline |
+| Character search: C-] reads a character and moves the cursor to its next occurrence (`character-search-backward` available unbound) | readline |
 | Abbreviation expansion on space via `Hooks::expand_abbreviation` | fish `abbr` |
 | Right-side prompt (second `read_line` argument), hidden when the line grows into it | zsh `$RPS1`, fish, reedline |
 | Bracketed paste: paste arrives as one event — tabs/ESC insert literally, nothing executes until Enter; inserts literally in vi normal mode too; multi-line pastes keep their newlines (shown `⏎`) and return as a unit; multi-line history entries stored joined with `; ` (bash `cmdhist`) | readline 8.1+, ZLE, fish, reedline |
-| vi mode (`Hooks::vi_mode`): counts (motions and `x ~ r p P` — `3rx`, `3p`); `d`/`c`/`y` operators over motions; `h l 0 ^ $ w W b B e E f F t T ; , %`; the `iw`/`aw` text objects; `x X D C s S Y r ~ p P u`; `i I a A`; `k`/`j` history, `G` fetches by count; `cw`≡`ce` quirk; Esc backs the cursor up one | readline vi mode, ksh, ZLE; vim (`%`, `G`, `iw`/`aw`, counts) |
+| vi mode (`Hooks::vi_mode`): counts (motions and `x ~ r p P` — `3rx`, `3p`); `d`/`c`/`y` operators over motions; `h l 0 ^ $ w W b B e E f F t T ; , %`; the `iw`/`aw` text objects; `x X D C s S Y r ~ p P u` (Delete ≡ `x`); `i I a A`; `k`/`j` history, `G` fetches by count; `cw`≡`ce` quirk; Esc backs the cursor up one | readline vi mode, ksh, ZLE; vim (`%`, `G`, `iw`/`aw`, counts) |
 | Mode indicator: `set_show_mode_in_prompt` prefixes `(ins)`/`(cmd)` (vi) or `@` (emacs) to the prompt | readline `show-mode-in-prompt` and its default mode strings |
-| Wide chars + UTF-8 input assembly; ANSI-aware width math (CSI *and* OSC — a hyperlinked or titled prompt measures correctly); soft-wrap repaint without flicker (paint-then-clear); `^X` control-char visualization keeps cursor math exact | all modern |
+| Wide chars + UTF-8 input assembly (including Alt + non-ASCII chords, `\M-ö`); ANSI-aware width math (CSI *and* OSC — a hyperlinked or titled prompt measures correctly); soft-wrap repaint without flicker (paint-then-clear); `^X` control-char visualization keeps cursor math exact; tabs render at 8-column stops of the true display offset | all modern |
 | Multi-line prompts (`PS1` with newlines): the lines before the last paint once per region; only the final line is the repainted edit row | readline, zsh |
 | Robust escape decoding: unrecognized CSI sequences (SGR mouse reports, private modes) are consumed whole per ECMA-48 instead of leaking their tail into the buffer as typed text | readline, all modern |
 | Resize: width re-read on every repaint; a resize while idle at the prompt repaints within a poll tick (~200ms) | readline SIGWINCH, approximated without signals |

@@ -327,6 +327,32 @@ fn host_binding_rewrites_the_line() {
 }
 
 #[test]
+fn character_search_moves_to_the_typed_char() {
+    // C-a to column 0, C-] then 'l' jumps onto the first 'l', C-d
+    // deletes it (readline character-search).
+    let out = run_session(&[b"hello", b"\x01", b"\x1dl", b"\x04", b"\r"]);
+    assert!(
+        out.contains(&echo("helo")),
+        "character-search wrong:\n{out}"
+    );
+}
+
+#[test]
+fn possible_completions_lists_without_editing() {
+    // M-? prints the candidate list but leaves the buffer untouched
+    // (no LCP insertion, unlike Tab).
+    let out = run_session_in("hooked", "hooked> ", &[b"al", b"\x1b?", b"\r"]);
+    assert!(
+        out.contains("alphanumeric"),
+        "candidate list missing:\n{out}"
+    );
+    assert!(
+        out.contains(&echo("al")),
+        "buffer was modified by M-?:\n{out}"
+    );
+}
+
+#[test]
 fn vi_normal_mode_edits_and_shows_the_mode() {
     // "xhello", Esc into normal mode, `0` to column 0, `x` deletes the
     // stray character, Enter accepts from normal mode.

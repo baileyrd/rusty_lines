@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Incremental search now leaves the cursor *on* the matched text when
+  the search is accepted or exited (readline's point), instead of at
+  end-of-line — you searched for it to edit it.
+- Prefix search (PageUp/PageDown) re-anchors on the buffer up to the
+  cursor whenever the previous key wasn't itself a prefix search (zsh's
+  rule). Previously the anchor was captured only when off history, so a
+  PageUp after a plain Up searched with a stale or empty prefix.
+- Undo now chunks runs of self-insert into groups of at most 20
+  characters (readline's grouping): one C-_ no longer wipes an entire
+  typed line.
+- Completion append character (readline's
+  `rl_completion_append_character`): a unique, fully-inserted match is
+  followed by a space so the cursor is ready for the next word;
+  `set_completion_append_character` changes or disables it.
+- `possible-completions` (M-?): list the candidates without touching
+  the buffer; `insert-completions` (M-*): insert every match,
+  space-separated — both stock readline commands.
+- `character-search` (C-]): reads one character and moves the cursor to
+  its next occurrence; `character-search-backward` is available unbound
+  (its readline default M-C-] isn't a decodable chord here).
+- vi: the Delete key now kills into the ring like `x` (vim), honoring
+  counts, instead of discarding the text.
+- Alt + non-ASCII chords (`\M-ö`) decode: the ESC-prefixed UTF-8
+  sequence is assembled whole — previously the lead byte was consumed
+  and the continuations decoded as garbage keys.
+- Tabs render at 8-column stops of the true display offset (prompt
+  included) instead of a fixed four spaces, so tab-indented pastes line
+  up the way terminals show them; cursor math tracks the same expansion.
+- `BellStyle::Visible` holds the reverse-video flash ~80ms before
+  clearing it (input ends it early) — set-then-unset in a single write
+  could render zero frames on many terminals.
 - Multi-line prompts (a `PS1` with newlines) now work: everything up to
   the prompt's last newline paints once per edit region (readline's
   approach); only the final line joins the per-keystroke repaint. The
