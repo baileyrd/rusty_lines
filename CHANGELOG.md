@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+- Multi-line prompts (a `PS1` with newlines) now work: everything up to
+  the prompt's last newline paints once per edit region (readline's
+  approach); only the final line joins the per-keystroke repaint. The
+  old row accounting duplicated the prompt down the screen on every
+  keystroke.
+- `Hooks::highlight` contract change: the hook now receives the *raw*
+  buffer (exactly what Enter returns — real tabs/newlines, true byte
+  offsets) instead of the control-char-visualized text, so a parser
+  highlights what the user actually typed. The hook's SGR markup passes
+  through and the editor re-applies the `^X`/`⏎`/tab visualization
+  around it; a non-SGR escape from the hook is neutralized rather than
+  sent to the terminal, and a buffer containing a literal ESC paints
+  unhighlighted (the markup would be ambiguous). Hosts that compensated
+  for the visualized input should drop that compensation.
+- Flicker-free repaint: the render used to clear the edit region and
+  then repaint it, showing a blank frame every keystroke (visible on
+  slow terminals and ssh). It now overwrites in place and erases only
+  the leftover tail (paint-then-clear, readline's redisplay order).
+- History file safety: `save_history` writes atomically (sibling temp
+  file + rename, so a crash mid-write can't truncate the history) and
+  new files are created mode 0600 on Unix, like bash's history file —
+  history routinely contains secrets. Existing files keep their
+  permissions; `append_history`'s create path is 0600 too.
+- Case-insensitive history search: `Editor::set_search_ignore_case`
+  (readline 8.1's `search-ignore-case`) covers C-r/C-s incremental
+  search and the PageUp/PageDown prefix search.
+- Reverse menu cycling: Shift-Tab (`CSI Z`, decoded with or without
+  modifier parameters) is `EditorAction::MenuCompleteBackward` —
+  readline's `menu-complete-backward`, zsh's `reverse-menu-complete`;
+  a cold backward step starts on the last candidate.
+- vi counts for `r`, `p`, `P` (vim semantics): `3rx` replaces three
+  characters — failing outright, with a bell, when fewer remain — and
+  `3p`/`3P` paste three copies.
+- OSC-aware width math: `display_width` now skips OSC sequences
+  (BEL- or ST-terminated) — a prompt carrying an OSC-8 hyperlink or a
+  window-title sequence had its whole payload counted as printable
+  width, misplacing the cursor.
+- Fix: an unrecognized CSI sequence was cut at its first non-digit
+  byte, so an SGR mouse report (`ESC[<65;5;10M`) leaked `65;5;10M`
+  into the buffer as typed text. The decoder now consumes the full
+  ECMA-48 grammar (parameter bytes 0x30–0x3F, intermediates 0x20–0x2F,
+  one final byte) and swallows unknown sequences whole.
+- New `examples/vi.rs` (vi mode + mode indicator + a deliberately
+  multi-line prompt) and pty tests for normal-mode editing, `daw`,
+  count-replace, and once-per-region prompt-prefix painting.
 - Operate-and-get-next (readline, bash C-o): `EditorAction::OperateAndGetNext`
   accepts the line and pre-loads the next `read_line` with the history
   entry after the one just executed, for replaying command sequences.

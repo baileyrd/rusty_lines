@@ -327,6 +327,55 @@ fn host_binding_rewrites_the_line() {
 }
 
 #[test]
+fn vi_normal_mode_edits_and_shows_the_mode() {
+    // "xhello", Esc into normal mode, `0` to column 0, `x` deletes the
+    // stray character, Enter accepts from normal mode.
+    let out = run_session_in("vi", "vi> ", &[b"xhello", b"\x1b", b"0x", b"\r"]);
+    assert!(out.contains(&echo("hello")), "vi edit wrong:\n{out}");
+    assert!(
+        out.contains("(cmd)"),
+        "mode indicator missing after Esc:\n{out}"
+    );
+    assert!(
+        out.contains("(ins)"),
+        "insert-mode indicator missing:\n{out}"
+    );
+}
+
+#[test]
+fn vi_daw_deletes_a_word_object() {
+    // Esc leaves the cursor on the last char of "three"; `bb` walks back
+    // to "two"; `daw` deletes it and its trailing space.
+    let out = run_session_in(
+        "vi",
+        "vi> ",
+        &[b"one two three", b"\x1b", b"bb", b"daw", b"\r"],
+    );
+    assert!(out.contains(&echo("one three")), "daw wrong:\n{out}");
+}
+
+#[test]
+fn vi_count_replace() {
+    // `3rx` replaces three characters with xxx (vim count semantics).
+    let out = run_session_in("vi", "vi> ", &[b"abc", b"\x1b", b"0", b"3rx", b"\r"]);
+    assert!(out.contains(&echo("xxx")), "3rx wrong:\n{out}");
+}
+
+#[test]
+fn multiline_prompt_prefix_paints_once_per_region() {
+    // The vi example's prompt is "vi demo\nvi> ". The prefix line must
+    // paint once per region — not once per keystroke, which is what the
+    // old row accounting degenerated to with a '\n' in the prompt.
+    let out = run_session_in("vi", "vi> ", &[b"abcde", b"\r"]);
+    assert!(out.contains(&echo("abcde")), "line lost:\n{out}");
+    let prefixes = out.matches("vi demo").count();
+    assert!(
+        prefixes <= 3,
+        "prompt prefix repainted per keystroke ({prefixes} times):\n{out}"
+    );
+}
+
+#[test]
 fn read_line_timeout_expires_at_the_prompt() {
     // Sit at the timeout example's prompt without typing: the 2s deadline
     // must fire, print bash's message, and exit cleanly.
