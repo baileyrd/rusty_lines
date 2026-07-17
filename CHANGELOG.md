@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- Pre-seeded lines: `Editor::read_line_with_initial(prompt, rprompt,
+  hooks, (left, right))` starts the edit with text in the buffer and
+  the cursor between the halves (rustyline's `readline_with_initial`,
+  zsh `print -z`) — `fc`-style edit-and-rerun, offered corrections.
+  Ignored on a non-tty stdin and on the non-Unix fallback.
+- Command-name mapping: `EditorAction::name()` and
+  `EditorAction::from_name()` expose readline's command names
+  (`kill-line`, `menu-complete-backward`, …) so a host's `bind` builtin
+  doesn't maintain its own drift-prone table; the exhaustive match
+  forces future actions to get names.
+- Host-binding introspection: `Editor::host_bindings()` lists the
+  `bind_host` entries as (key spec, tag) pairs — bash's `bind -X`,
+  which `bindings()` deliberately omits.
+- Fix: `operate-and-get-next` (C-o) recalled the wrong entry when
+  `erasedups` (or a host history edit) shifted indices between lines;
+  the recall now stores the entry text and re-locates it by content.
+- Fix: pasting during incremental search exited the search and
+  discarded the paste; it now types into the query (bash's behavior),
+  with newlines flattened to spaces.
+- Incremental search starts from the current history position after an
+  unedited Up-recall (readline continues backward from point in
+  history) instead of restarting at the newest entry; typed characters
+  search at-or-before the current match. An edited recall does not
+  seed the position, so exiting an empty search can never clobber
+  edits.
+- Hardening: out-of-range or mid-character word-start offsets returned
+  by `Hooks::complete` / `Hooks::expand_abbreviation` are clamped to a
+  char boundary at or before the cursor instead of panicking the read
+  loop — a hook bug must not take the host shell down.
+- Fix: the piped-stdin path (`read_line_plain`) swallowed EINTR without
+  calling `Hooks::on_interrupted_read`, so hosts running piped scripts
+  never got their trap callback; it now fires like the raw path.
+- Fix: Shift-Tab was dead in vi normal mode (it tore down the armed
+  completion menu and did nothing); it now reverse-cycles there, like
+  Tab completes there.
+- Performance: the alphanumeric word motions no longer collect the
+  line into a `Vec` per keystroke, and case-insensitive search matching
+  compares case-folded char streams instead of allocating two lowercase
+  `String`s per history entry per keystroke.
 - Incremental search now leaves the cursor *on* the matched text when
   the search is accepted or exited (readline's point), instead of at
   end-of-line — you searched for it to edit it.

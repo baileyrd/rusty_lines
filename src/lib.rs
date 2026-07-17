@@ -288,6 +288,125 @@ pub enum EditorAction {
     EditAndExecuteCommand,
 }
 
+impl EditorAction {
+    /// The action's readline command name (`kill-line`, `menu-complete`,
+    /// …) — what a host's `bind` builtin prints and parses, so shells
+    /// don't each maintain a drift-prone name table. Actions with no
+    /// readline equivalent use the same kebab-case convention
+    /// (`interrupt`, `delete-char-or-eof`).
+    pub fn name(self) -> &'static str {
+        // Exhaustive on purpose: a new variant fails to compile until it
+        // gets a name here (and a row in `from_name`).
+        match self {
+            EditorAction::SelfInsert => "self-insert",
+            EditorAction::AcceptLine => "accept-line",
+            EditorAction::OperateAndGetNext => "operate-and-get-next",
+            EditorAction::Interrupt => "interrupt",
+            EditorAction::DeleteCharOrEof => "delete-char-or-eof",
+            EditorAction::DeleteChar => "delete-char",
+            EditorAction::BackwardDeleteChar => "backward-delete-char",
+            EditorAction::BeginningOfLine => "beginning-of-line",
+            EditorAction::EndOfLine => "end-of-line",
+            EditorAction::ForwardChar => "forward-char",
+            EditorAction::BackwardChar => "backward-char",
+            EditorAction::ForwardWord => "forward-word",
+            EditorAction::BackwardWord => "backward-word",
+            EditorAction::KillLine => "kill-line",
+            EditorAction::KillWholeLine => "kill-whole-line",
+            EditorAction::DeleteHorizontalSpace => "delete-horizontal-space",
+            EditorAction::UnixLineDiscard => "unix-line-discard",
+            EditorAction::UnixWordRubout => "unix-word-rubout",
+            EditorAction::KillWord => "kill-word",
+            EditorAction::BackwardKillWord => "backward-kill-word",
+            EditorAction::Yank => "yank",
+            EditorAction::YankPop => "yank-pop",
+            EditorAction::TransposeChars => "transpose-chars",
+            EditorAction::TransposeWords => "transpose-words",
+            EditorAction::UpcaseWord => "upcase-word",
+            EditorAction::DowncaseWord => "downcase-word",
+            EditorAction::CapitalizeWord => "capitalize-word",
+            EditorAction::Undo => "undo",
+            EditorAction::RevertLine => "revert-line",
+            EditorAction::InsertLastArgument => "insert-last-argument",
+            EditorAction::PreviousHistory => "previous-history",
+            EditorAction::NextHistory => "next-history",
+            EditorAction::BeginningOfHistory => "beginning-of-history",
+            EditorAction::EndOfHistory => "end-of-history",
+            EditorAction::HistorySearchBackward => "history-search-backward",
+            EditorAction::HistorySearchForward => "history-search-forward",
+            EditorAction::ReverseSearchHistory => "reverse-search-history",
+            EditorAction::ForwardSearchHistory => "forward-search-history",
+            EditorAction::ClearScreen => "clear-screen",
+            EditorAction::Complete => "complete",
+            EditorAction::MenuComplete => "menu-complete",
+            EditorAction::MenuCompleteBackward => "menu-complete-backward",
+            EditorAction::PossibleCompletions => "possible-completions",
+            EditorAction::InsertCompletions => "insert-completions",
+            EditorAction::CharacterSearch => "character-search",
+            EditorAction::CharacterSearchBackward => "character-search-backward",
+            EditorAction::QuotedInsert => "quoted-insert",
+            EditorAction::EditAndExecuteCommand => "edit-and-execute-command",
+        }
+    }
+
+    /// The inverse of [`name`](EditorAction::name): resolve a readline
+    /// command name to the action, `None` for anything unrecognized
+    /// (including names of readline commands not modeled here).
+    pub fn from_name(name: &str) -> Option<EditorAction> {
+        Some(match name {
+            "self-insert" => EditorAction::SelfInsert,
+            "accept-line" => EditorAction::AcceptLine,
+            "operate-and-get-next" => EditorAction::OperateAndGetNext,
+            "interrupt" => EditorAction::Interrupt,
+            "delete-char-or-eof" => EditorAction::DeleteCharOrEof,
+            "delete-char" => EditorAction::DeleteChar,
+            "backward-delete-char" => EditorAction::BackwardDeleteChar,
+            "beginning-of-line" => EditorAction::BeginningOfLine,
+            "end-of-line" => EditorAction::EndOfLine,
+            "forward-char" => EditorAction::ForwardChar,
+            "backward-char" => EditorAction::BackwardChar,
+            "forward-word" => EditorAction::ForwardWord,
+            "backward-word" => EditorAction::BackwardWord,
+            "kill-line" => EditorAction::KillLine,
+            "kill-whole-line" => EditorAction::KillWholeLine,
+            "delete-horizontal-space" => EditorAction::DeleteHorizontalSpace,
+            "unix-line-discard" => EditorAction::UnixLineDiscard,
+            "unix-word-rubout" => EditorAction::UnixWordRubout,
+            "kill-word" => EditorAction::KillWord,
+            "backward-kill-word" => EditorAction::BackwardKillWord,
+            "yank" => EditorAction::Yank,
+            "yank-pop" => EditorAction::YankPop,
+            "transpose-chars" => EditorAction::TransposeChars,
+            "transpose-words" => EditorAction::TransposeWords,
+            "upcase-word" => EditorAction::UpcaseWord,
+            "downcase-word" => EditorAction::DowncaseWord,
+            "capitalize-word" => EditorAction::CapitalizeWord,
+            "undo" => EditorAction::Undo,
+            "revert-line" => EditorAction::RevertLine,
+            "insert-last-argument" => EditorAction::InsertLastArgument,
+            "previous-history" => EditorAction::PreviousHistory,
+            "next-history" => EditorAction::NextHistory,
+            "beginning-of-history" => EditorAction::BeginningOfHistory,
+            "end-of-history" => EditorAction::EndOfHistory,
+            "history-search-backward" => EditorAction::HistorySearchBackward,
+            "history-search-forward" => EditorAction::HistorySearchForward,
+            "reverse-search-history" => EditorAction::ReverseSearchHistory,
+            "forward-search-history" => EditorAction::ForwardSearchHistory,
+            "clear-screen" => EditorAction::ClearScreen,
+            "complete" => EditorAction::Complete,
+            "menu-complete" => EditorAction::MenuComplete,
+            "menu-complete-backward" => EditorAction::MenuCompleteBackward,
+            "possible-completions" => EditorAction::PossibleCompletions,
+            "insert-completions" => EditorAction::InsertCompletions,
+            "character-search" => EditorAction::CharacterSearch,
+            "character-search-backward" => EditorAction::CharacterSearchBackward,
+            "quoted-insert" => EditorAction::QuotedInsert,
+            "edit-and-execute-command" => EditorAction::EditAndExecuteCommand,
+            _ => return None,
+        })
+    }
+}
+
 /// What ringing the terminal bell does — readline's `bell-style`
 /// variable, set via [`Editor::set_bell_style`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -431,8 +550,10 @@ pub struct Editor {
     ignore_space: bool,
     /// C-o (`operate-and-get-next`): the history index the next
     /// `read_line` should pre-load, captured when the key accepted a
-    /// recalled entry.
-    next_recall: Option<usize>,
+    /// recalled entry — together with the entry's text at capture time,
+    /// so the entry can be re-located if `erasedups` (or any host
+    /// history edit) shifts indices before the next call.
+    next_recall: Option<(usize, String)>,
     /// When set, `save_history`/`append_history` write bash's `#<epoch>`
     /// timestamp comment before each entry (`HISTTIMEFORMAT`'s format).
     write_timestamps: bool,
@@ -444,9 +565,14 @@ pub struct Editor {
 }
 
 /// The piped-stdin path: one line, no prompt, no editing. A deadline, if
-/// set, is honored between bytes via `poll`.
+/// set, is honored between bytes via `poll`; a signal interrupting the
+/// read fires [`Hooks::on_interrupted_read`] like the raw path does, so
+/// a host running a piped script still gets its trap callback.
 #[cfg(unix)]
-fn read_line_plain(deadline: Option<std::time::Instant>) -> io::Result<ReadResult> {
+fn read_line_plain(
+    hooks: &dyn Hooks,
+    deadline: Option<std::time::Instant>,
+) -> io::Result<ReadResult> {
     let mut line = Vec::new();
     let mut b = [0u8; 1];
     loop {
@@ -467,7 +593,10 @@ fn read_line_plain(deadline: Option<std::time::Instant>) -> io::Result<ReadResul
             }
             Ok(_) if b[0] == b'\n' => break,
             Ok(_) => line.push(b[0]),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                hooks.on_interrupted_read();
+                continue;
+            }
             Err(e) => return Err(e),
         }
     }
@@ -560,6 +689,17 @@ impl Editor {
             _ => None,
         });
         defaults.chain(custom)
+    }
+
+    /// The host-command bindings, as (key spec, tag) pairs — the
+    /// [`bind_host`](Editor::bind_host) entries that
+    /// [`bindings`](Editor::bindings) deliberately omits, so a shell can
+    /// list them (bash's `bind -X`).
+    pub fn host_bindings(&self) -> impl Iterator<Item = (String, &str)> + '_ {
+        self.bindings.iter().filter_map(|(k, b)| match b {
+            Binding::Host(tag) => Some((key_spec(k), tag.as_str())),
+            _ => None,
+        })
     }
 
     /// Case-insensitive completion matching (readline's
@@ -862,6 +1002,34 @@ impl Editor {
         hooks: &dyn Hooks,
         timeout: Option<std::time::Duration>,
     ) -> io::Result<ReadResult> {
+        self.read_line_inner(prompt, rprompt, hooks, timeout, None)
+    }
+
+    /// [`read_line`](Editor::read_line) with the buffer pre-seeded:
+    /// `initial` is `(left, right)` text placed in the buffer with the
+    /// cursor between the two — rustyline's `readline_with_initial`,
+    /// zsh's `print -z`. How a host implements `fc`-style edit-and-rerun
+    /// or offers a correction the user can accept or edit. On a non-tty
+    /// stdin (and on non-Unix builds) there is no buffer to seed and the
+    /// text is ignored.
+    pub fn read_line_with_initial(
+        &mut self,
+        prompt: &str,
+        rprompt: &str,
+        hooks: &dyn Hooks,
+        initial: (&str, &str),
+    ) -> io::Result<ReadResult> {
+        self.read_line_inner(prompt, rprompt, hooks, None, Some(initial))
+    }
+
+    fn read_line_inner(
+        &mut self,
+        prompt: &str,
+        rprompt: &str,
+        hooks: &dyn Hooks,
+        timeout: Option<std::time::Duration>,
+        initial: Option<(&str, &str)>,
+    ) -> io::Result<ReadResult> {
         #[cfg(unix)]
         {
             let deadline = timeout.map(|t| std::time::Instant::now() + t);
@@ -869,13 +1037,13 @@ impl Editor {
             // host) can't enter raw mode; fall back to a plain silent
             // read, like readline does.
             if !term_sys::isatty_stdin() {
-                return read_line_plain(deadline);
+                return read_line_plain(hooks, deadline);
             }
-            read_line_raw(self, prompt, rprompt, hooks, deadline)
+            read_line_raw(self, prompt, rprompt, hooks, deadline, initial)
         }
         #[cfg(not(unix))]
         {
-            let _ = timeout;
+            let _ = (timeout, initial);
             // No raw terminal on this platform: a plain buffered read
             // with no editing — a documented narrowing. Mirrors the Unix
             // fallback (`read_line_plain`): a non-tty stdin doesn't get the
@@ -1756,6 +1924,29 @@ struct SearchState {
     failed: bool,
 }
 
+/// Sanitize a word-start offset returned by a host hook (`complete`,
+/// `expand_abbreviation`): past-the-cursor or mid-character offsets
+/// would panic the slicing below — a hook bug must not take the host's
+/// read loop down.
+#[cfg(unix)]
+fn clamp_start(s: &str, start: usize, cursor: usize) -> usize {
+    let mut start = start.min(cursor);
+    while !s.is_char_boundary(start) {
+        start -= 1;
+    }
+    start
+}
+
+/// Locate a C-o recall target: `i` where the entry was at capture time,
+/// re-found by content when erasedups or a host history edit shifted the
+/// indices in between.
+fn resolve_recall(history: &[String], i: usize, expected: &str) -> Option<usize> {
+    if history.get(i).map(String::as_str) == Some(expected) {
+        return Some(i);
+    }
+    history.iter().rposition(|h| h == expected)
+}
+
 #[cfg(unix)]
 fn read_line_raw(
     ed: &mut Editor,
@@ -1763,6 +1954,7 @@ fn read_line_raw(
     rprompt: &str,
     hooks: &dyn Hooks,
     deadline: Option<std::time::Instant>,
+    initial: Option<(&str, &str)>,
 ) -> io::Result<ReadResult> {
     let raw = RawMode::enable()?;
     let _paste = BracketedPaste::enable();
@@ -1806,10 +1998,17 @@ fn read_line_raw(
         cfg,
         hooks,
     };
-    // C-o on the previous line: pre-load the history entry after the one
-    // just executed (readline `operate-and-get-next`).
-    if let Some(i) = next_recall.take()
-        && i < history.len()
+    if let Some((left, right)) = initial {
+        // An explicitly seeded line (read_line_with_initial) wins over a
+        // pending C-o recall.
+        st.buffer = format!("{left}{right}");
+        st.cursor = left.len();
+        next_recall.take();
+    } else if let Some((i, expected)) = next_recall.take()
+        // C-o on the previous line: pre-load the history entry after the
+        // one just executed (readline `operate-and-get-next`) — located
+        // by content when erasedups/host edits shifted the indices.
+        && let Some(i) = resolve_recall(history, i, &expected)
     {
         st.buffer = history[i].clone();
         st.cursor = st.buffer.len();
@@ -1880,11 +2079,11 @@ fn read_line_raw(
                 Key::Ctrl('c') => AfterKey::Interrupted,
                 Key::Ctrl('d') if st.buffer.is_empty() => AfterKey::Eof,
                 Key::Ctrl('r') => {
-                    start_search(&mut st, false);
+                    start_search(&mut st, history, false);
                     AfterKey::Done
                 }
                 Key::Ctrl('s') => {
-                    start_search(&mut st, true);
+                    start_search(&mut st, history, true);
                     AfterKey::Done
                 }
                 Key::Ctrl('l') => {
@@ -1901,6 +2100,13 @@ fn read_line_raw(
                     AfterKey::Done
                 }
                 Key::Tab => run_action(&mut st, EditorAction::Complete, &key, history, kill_ring)?,
+                Key::BackTab => run_action(
+                    &mut st,
+                    EditorAction::MenuCompleteBackward,
+                    &key,
+                    history,
+                    kill_ring,
+                )?,
                 Key::Paste(s) => {
                     // A bracketed paste inserts literally in normal mode
                     // too (vim, readline vi mode) — it must not run
@@ -1962,7 +2168,9 @@ fn read_line_raw(
             AfterKey::AcceptAndRecall => {
                 // C-o: like Accept, but remember the entry after this one
                 // so the next read_line starts on it.
-                *next_recall = st.hist_index.map(|i| i + 1);
+                *next_recall = st
+                    .hist_index
+                    .and_then(|i| history.get(i + 1).map(|e| (i + 1, e.clone())));
                 finish_line(&mut st)?;
                 return Ok(ReadResult::Line(st.buffer));
             }
@@ -2028,8 +2236,9 @@ fn finish_line(st: &mut LineState) -> io::Result<()> {
 #[cfg(unix)]
 fn key_completes(key: &Key, bindings: &[(Key, Binding)], vi_normal: bool) -> bool {
     if vi_normal {
-        // vi normal mode's keymap is fixed: only Tab completes there.
-        return *key == Key::Tab;
+        // vi normal mode's keymap is fixed: Tab completes and Shift-Tab
+        // cycles backward there.
+        return matches!(key, Key::Tab | Key::BackTab);
     }
     let action = match bindings.iter().find(|(k, _)| k == key) {
         Some((_, Binding::Action(a))) => Some(*a),
@@ -2072,10 +2281,17 @@ fn insert_paste(st: &mut LineState, s: &str) {
 
 /// Enter C-r / C-s incremental search.
 #[cfg(unix)]
-fn start_search(st: &mut LineState, forward: bool) {
+fn start_search(st: &mut LineState, history: &[String], forward: bool) {
     st.search = Some(SearchState {
         query: String::new(),
-        hit: None,
+        // Search from the current history position: after recalling a
+        // line with Up, C-r continues backward from there (readline),
+        // not from the newest entry. Only an *unedited* recall seeds the
+        // position — exiting a seeded search rewrites the buffer from
+        // history, which must never clobber the user's edits.
+        hit: st
+            .hist_index
+            .filter(|&i| history.get(i) == Some(&st.buffer)),
         forward,
         failed: false,
     });
@@ -2195,6 +2411,7 @@ fn run_action(
                 && let Some((start, expansion)) =
                     st.hooks.expand_abbreviation(&st.buffer, st.cursor)
             {
+                let start = clamp_start(&st.buffer, start, st.cursor);
                 st.buffer.replace_range(start..st.cursor, &expansion);
                 st.cursor = start + expansion.len();
             }
@@ -2309,8 +2526,8 @@ fn run_action(
         EditorAction::NextHistory => history_next(st, history),
         EditorAction::HistorySearchBackward => history_prefix_prev(st, history),
         EditorAction::HistorySearchForward => history_prefix_next(st, history),
-        EditorAction::ReverseSearchHistory => start_search(st, false),
-        EditorAction::ForwardSearchHistory => start_search(st, true),
+        EditorAction::ReverseSearchHistory => start_search(st, history, false),
+        EditorAction::ForwardSearchHistory => start_search(st, history, true),
         EditorAction::ClearScreen => clear_screen(st),
         EditorAction::Complete => {
             if st.menu.is_some() {
@@ -2350,6 +2567,7 @@ fn run_action(
         EditorAction::InsertCompletions => {
             // M-*: insert every match, space-separated (readline).
             let (start, mut candidates) = st.hooks.complete(&st.buffer, st.cursor);
+            let start = clamp_start(&st.buffer, start, st.cursor);
             if candidates.is_empty() {
                 bell(st.cfg.bell)?;
             } else {
@@ -2799,9 +3017,23 @@ fn handle_search_key(
         }
         Key::Char(c) => {
             search.query.push(c);
-            // On a miss, keep showing the last match under the "failed"
-            // label, like readline.
-            let found = find_match(history, &search.query, history.len(), ci);
+            // Search at-or-before the current position (readline keeps
+            // the match as near as possible); on a miss, keep showing
+            // the last match under the "failed" label.
+            let limit = search.hit.map(|h| h + 1).unwrap_or(history.len());
+            let found = find_match(history, &search.query, limit, ci);
+            search.failed = found.is_none();
+            search.hit = found.or(search.hit);
+        }
+        Key::Paste(s) => {
+            // A paste types into the query (bash): pasting an error
+            // message to find it in history must not exit the search
+            // and drop the text. Entries are single-line, so newlines
+            // become spaces.
+            let s = s.replace(['\r', '\n'], " ");
+            search.query.push_str(s.trim_end());
+            let limit = search.hit.map(|h| h + 1).unwrap_or(history.len());
+            let found = find_match(history, &search.query, limit, ci);
             search.failed = found.is_none();
             search.hit = found.or(search.hit);
         }
@@ -2841,21 +3073,35 @@ fn match_pos(hay: &str, needle: &str, ignore_case: bool) -> Option<usize> {
         .find(|&i| starts_with_match(&hay[i..], needle, true))
 }
 
+/// Case-folded prefix comparison with no allocation — the ci matchers
+/// run against every history entry on every search keystroke, where a
+/// `to_lowercase()` per entry was two `String`s each.
+fn starts_with_fold(hay: &str, prefix: &str) -> bool {
+    let mut h = hay.chars().flat_map(char::to_lowercase);
+    prefix
+        .chars()
+        .flat_map(char::to_lowercase)
+        .all(|p| h.next() == Some(p))
+}
+
 /// Substring match, optionally case-insensitive (readline 8.1's
 /// `search-ignore-case`).
 fn contains_match(hay: &str, needle: &str, ignore_case: bool) -> bool {
-    if ignore_case {
-        hay.to_lowercase().contains(&needle.to_lowercase())
-    } else {
-        hay.contains(needle)
+    if !ignore_case {
+        return hay.contains(needle);
     }
+    if needle.is_empty() {
+        return true;
+    }
+    hay.char_indices()
+        .any(|(i, _)| starts_with_fold(&hay[i..], needle))
 }
 
 /// Prefix match, optionally case-insensitive — the prefix-search twin of
 /// [`contains_match`].
 fn starts_with_match(hay: &str, prefix: &str, ignore_case: bool) -> bool {
     if ignore_case {
-        hay.to_lowercase().starts_with(&prefix.to_lowercase())
+        starts_with_fold(hay, prefix)
     } else {
         hay.starts_with(prefix)
     }
@@ -2958,33 +3204,39 @@ fn word_back(s: &str, pos: usize) -> usize {
 }
 
 /// Start of the alphanumeric word before `pos` (readline's M-b flavor).
+/// A plain reverse walk — these motions run per keystroke, so no
+/// collecting the whole line into a `Vec` first.
 fn word_back_alnum(s: &str, pos: usize) -> usize {
-    let chars: Vec<(usize, char)> = s[..pos].char_indices().collect();
-    let mut i = chars.len();
-    while i > 0 && !chars[i - 1].1.is_alphanumeric() {
-        i -= 1;
+    let mut boundary = pos;
+    let mut it = s[..pos].char_indices().rev();
+    let mut cur = it.next();
+    while let Some((i, c)) = cur {
+        if c.is_alphanumeric() {
+            break;
+        }
+        boundary = i;
+        cur = it.next();
     }
-    while i > 0 && chars[i - 1].1.is_alphanumeric() {
-        i -= 1;
+    while let Some((i, c)) = cur {
+        if !c.is_alphanumeric() {
+            break;
+        }
+        boundary = i;
+        cur = it.next();
     }
-    if i < chars.len() { chars[i].0 } else { pos }
+    boundary
 }
 
 /// End of the alphanumeric word after `pos` (readline's M-f flavor).
 fn word_forward_alnum(s: &str, pos: usize) -> usize {
-    let chars: Vec<(usize, char)> = s[pos..].char_indices().collect();
-    let mut i = 0;
-    while i < chars.len() && !chars[i].1.is_alphanumeric() {
-        i += 1;
+    let mut it = s[pos..].char_indices().peekable();
+    while it.peek().is_some_and(|&(_, c)| !c.is_alphanumeric()) {
+        it.next();
     }
-    while i < chars.len() && chars[i].1.is_alphanumeric() {
-        i += 1;
+    while it.peek().is_some_and(|&(_, c)| c.is_alphanumeric()) {
+        it.next();
     }
-    if i < chars.len() {
-        pos + chars[i].0
-    } else {
-        s.len()
-    }
+    it.peek().map(|&(i, _)| pos + i).unwrap_or(s.len())
 }
 
 /// vi small-word character class: whitespace / word (alnum + `_`) /
@@ -3603,6 +3855,7 @@ fn history_prefix_next(st: &mut LineState, history: &[String]) {
 #[cfg(unix)]
 fn complete_at_cursor(st: &mut LineState) -> io::Result<()> {
     let (start, mut candidates) = st.hooks.complete(&st.buffer, st.cursor);
+    let start = clamp_start(&st.buffer, start, st.cursor);
     if candidates.is_empty() {
         return bell(st.cfg.bell);
     }
@@ -3720,6 +3973,7 @@ fn menu_complete_start(st: &mut LineState) -> io::Result<()> {
 #[cfg(unix)]
 fn menu_arm(st: &mut LineState) -> io::Result<bool> {
     let (start, mut candidates) = st.hooks.complete(&st.buffer, st.cursor);
+    let start = clamp_start(&st.buffer, start, st.cursor);
     if candidates.is_empty() {
         bell(st.cfg.bell)?;
         return Ok(false);
@@ -4728,7 +4982,7 @@ mod tests {
         let history = vec!["alpha".to_string(), "beta".to_string()];
         let mut st = state("", 0);
         st.cfg.bell = BellStyle::None;
-        start_search(&mut st, false);
+        start_search(&mut st, &history, false);
         handle_search_key(&mut st, Key::Char('b'), &history).unwrap();
         let s = st.search.as_ref().unwrap();
         assert_eq!(s.hit, Some(1));
@@ -4915,7 +5169,7 @@ mod tests {
         let history = vec!["echo --verbose x".to_string()];
         let mut st = state("", 0);
         st.cfg.bell = BellStyle::None;
-        start_search(&mut st, false);
+        start_search(&mut st, &history, false);
         for c in "--v".chars() {
             handle_search_key(&mut st, Key::Char(c), &history).unwrap();
         }
@@ -5019,6 +5273,138 @@ mod tests {
         .unwrap();
         assert_eq!(st.buffer, "alpha beta"); // sorted, space-separated
         assert_eq!(st.cursor, 10);
+    }
+
+    #[test]
+    fn resolve_recall_survives_index_shifts() {
+        let hist = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Unshifted: the index still points at the expected entry.
+        let h = hist(&["a", "b", "c"]);
+        assert_eq!(resolve_recall(&h, 1, "b"), Some(1));
+        // erasedups removed an earlier duplicate: re-locate by content.
+        let h = hist(&["b", "c", "a"]);
+        assert_eq!(resolve_recall(&h, 1, "b"), Some(0));
+        // The entry vanished entirely: no recall.
+        let h = hist(&["c"]);
+        assert_eq!(resolve_recall(&h, 1, "b"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paste_during_search_types_into_the_query() {
+        let history = vec!["echo --verbose".to_string()];
+        let mut st = state("", 0);
+        st.cfg.bell = BellStyle::None;
+        start_search(&mut st, &history, false);
+        let outcome =
+            handle_search_key(&mut st, Key::Paste("--verb\n".to_string()), &history).unwrap();
+        assert!(matches!(outcome, SearchOutcome::Continue));
+        let s = st.search.as_ref().unwrap();
+        assert_eq!(s.query, "--verb");
+        assert_eq!(s.hit, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_starts_from_the_current_history_position() {
+        let history = vec!["git alpha".to_string(), "git beta".to_string()];
+        // Recalled (unedited) entry 0: the search is seeded there, so a
+        // query matching both entries stays on 0 instead of jumping to
+        // the newest match.
+        let mut st = state("git alpha", 9);
+        st.hist_index = Some(0);
+        start_search(&mut st, &history, false);
+        assert_eq!(st.search.as_ref().unwrap().hit, Some(0));
+        handle_search_key(&mut st, Key::Char('g'), &history).unwrap();
+        assert_eq!(st.search.as_ref().unwrap().hit, Some(0));
+        // An *edited* recall must not seed (exiting a seeded search
+        // rewrites the buffer from history, clobbering the edits).
+        let mut st = state("git alpha EDITED", 16);
+        st.hist_index = Some(0);
+        start_search(&mut st, &history, false);
+        assert_eq!(st.search.as_ref().unwrap().hit, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_hook_offsets_are_clamped_not_panics() {
+        struct Evil;
+        impl Hooks for Evil {
+            fn complete(&self, _line: &str, _pos: usize) -> (usize, Vec<Candidate>) {
+                (
+                    usize::MAX, // way past the cursor
+                    vec![Candidate {
+                        display: "x".to_string(),
+                        replacement: "x".to_string(),
+                    }],
+                )
+            }
+            fn expand_abbreviation(&self, _line: &str, _cursor: usize) -> Option<(usize, String)> {
+                Some((usize::MAX, "gone".to_string()))
+            }
+        }
+        let mut ring = VecDeque::new();
+        // Completion with an out-of-range start: clamped to the cursor.
+        let mut st = state_hooked("ab", 2, &Evil);
+        st.cfg.completion_append = None;
+        run_action(&mut st, EditorAction::Complete, &Key::Tab, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "abx");
+        // Abbreviation expansion likewise.
+        let mut st = state_hooked("ab", 2, &Evil);
+        run_action(
+            &mut st,
+            EditorAction::SelfInsert,
+            &Key::Char(' '),
+            &[],
+            &mut ring,
+        )
+        .unwrap();
+        assert_eq!(st.buffer, "abgone ");
+        // And a mid-character offset lands on the boundary below it.
+        assert_eq!(clamp_start("aü", 2, 3), 1);
+    }
+
+    #[test]
+    fn action_names_round_trip() {
+        for (_, action) in DEFAULT_BINDINGS {
+            assert_eq!(
+                EditorAction::from_name(action.name()),
+                Some(*action),
+                "{} does not round-trip",
+                action.name()
+            );
+        }
+        // Actions with no default key still have names.
+        for action in [
+            EditorAction::SelfInsert,
+            EditorAction::KillWholeLine,
+            EditorAction::MenuComplete,
+            EditorAction::CharacterSearchBackward,
+            EditorAction::EditAndExecuteCommand,
+        ] {
+            assert_eq!(EditorAction::from_name(action.name()), Some(action));
+        }
+        assert_eq!(EditorAction::from_name("no-such-command"), None);
+    }
+
+    #[test]
+    fn host_bindings_are_listable() {
+        let mut ed = Editor::new();
+        ed.bind_host("\\C-g", "fzf".to_string()).unwrap();
+        ed.bind("\\C-f", EditorAction::KillLine).unwrap();
+        let hosts: Vec<(String, &str)> = ed.host_bindings().collect();
+        assert_eq!(hosts, [("\\C-g".to_string(), "fzf")]);
+        // Action bindings stay out of the host listing and vice versa.
+        assert!(ed.bindings().any(|(k, _)| k == "\\C-f"));
+        assert!(ed.bindings().all(|(k, _)| k != "\\C-g"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn back_tab_completes_in_vi_normal_mode_too() {
+        assert!(key_completes(&Key::BackTab, &[], true));
+        assert!(key_completes(&Key::Tab, &[], true));
+        assert!(!key_completes(&Key::Char('x'), &[], true));
     }
 
     #[cfg(unix)]

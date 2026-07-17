@@ -50,8 +50,11 @@ psql, and hundreds of others link it.
   `possible-completions` (M-?) and `insert-completions` (M-*),
   `character-search` (C-]), the completion append character, the
   20-character self-insert undo chunking, point landing on the match
-  when a search ends, and the read timeout (`rl_set_timeout`, bash
-  `$TMOUT`).
+  when a search ends, the search continuing from the current history
+  position, the command-name mapping (`EditorAction::name`/`from_name`,
+  readline's `rl_named_function`), bash's `bind -X` host-binding
+  listing (`host_bindings()`), and the read timeout (`rl_set_timeout`,
+  bash `$TMOUT`).
 - **Declined:** `.inputrc` *file parsing* (the host's `bind` builtin
   passes readline key specs through instead); multi-key chord bindings
   beyond the built-in C-x set; keyboard macros (C-x `(` … C-x `)`);
@@ -143,9 +146,10 @@ most direct comparison.
 
 - **Matched for continuity:** the host-integration shape (rustyline's
   `Helper` trait ≈ `Hooks`: completer, hinter, highlighter); emacs + vi
-  keymaps; kill ring; undo; and one deliberate migration affordance —
-  `load_history` skips rustyline `FileHistory`'s `#V2` header so an
-  existing history file keeps working after the swap.
+  keymaps; kill ring; undo; `readline_with_initial`
+  (`read_line_with_initial` here); and one deliberate migration
+  affordance — `load_history` skips rustyline `FileHistory`'s `#V2`
+  header so an existing history file keeps working after the swap.
 - **Declined:** the validator hook (multi-line continuation decisions
   belong to the host's parser, not the editor); configurable
   completion types beyond list-style.
@@ -183,7 +187,8 @@ the README; kept in both places deliberately.)
 | Emacs basics: C-a/C-e/C-b/C-f, C-d, C-h, C-t, arrows, Home/End/Delete | readline, everywhere |
 | Kill ring: C-k, C-u, C-w, M-d, M-Backspace kill *into* a ring; C-y yanks; M-y rotates; consecutive kills grow one entry (append forward / prepend backward); ring survives across lines; depth configurable (`set_max_kill_ring_len`, and `set_max_undo_len` for undo) | readline, ZLE, fish |
 | More kill/delete commands: `kill-whole-line` (unbound, like readline) and `delete-horizontal-space` (M-\, a delete — nothing enters the ring) | readline |
-| Operate-and-get-next: C-o accepts the line and pre-loads the next `read_line` with the history entry after it, for replaying command sequences | readline `operate-and-get-next`, bash |
+| Operate-and-get-next: C-o accepts the line and pre-loads the next `read_line` with the history entry after it, for replaying command sequences; the recalled entry is re-located by content if `erasedups` or a host history edit shifted indices in between | readline `operate-and-get-next`, bash |
+| Pre-seeded lines: `read_line_with_initial((left, right))` starts the edit with text in the buffer and the cursor between the halves — `fc`-style edit-and-rerun, offered corrections | rustyline `readline_with_initial`, zsh `print -z` |
 | Word flavors: M-b/M-f/M-d/M-Backspace use alphanumeric words, C-w whitespace words (unix-word-rubout) | readline's two word classes |
 | Ctrl-arrow / Alt-arrow word motion (`CSI 1;5C` etc.) | every modern terminal editor |
 | Undo: C-_ , C-x C-u (and C-z, fish-style); runs of self-insert undo in groups of at most 20 characters (readline's chunking); M-r reverts the whole line | readline (incl. `revert-line`), ZLE, fish |
@@ -198,7 +203,7 @@ the README; kept in both places deliberately.)
 | History ignore-space option: `set_history_ignore_space` skips lines starting with a space | bash `HISTCONTROL=ignorespace`, zsh `HIST_IGNORE_SPACE` |
 | History persistence: `save_history` rewrites atomically (temp file + rename) and creates the file mode 0600, `append_history` appends only new entries; `load_history` tolerates a rustyline `#V2` header | bash `histappend` and its 0600 history file; rustyline migration |
 | Clear screen: C-l clears and repaints the edit region at the top | readline `clear-screen` |
-| Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search; a miss shows `(failed reverse-i-search)` and rings the bell, keeping the last match visible; leaving the search puts the cursor *on* the match (readline's point) | readline, ZLE |
+| Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search; starts from the current history position after an unedited recall; a paste types into the query; a miss shows `(failed reverse-i-search)` and rings the bell, keeping the last match visible; leaving the search puts the cursor *on* the match (readline's point) | readline, ZLE (bash paste-into-query) |
 | Case-insensitive search option: `set_search_ignore_case` covers incremental *and* prefix search | readline 8.1 `search-ignore-case` |
 | Bell on failed operations: no-match completion, history past either end, failed prefix search, failed vi find — all per `set_bell_style` | readline `bell-style` |
 | Prefix history search: PageUp/PageDown, M-p/M-n; the prefix re-anchors on the buffer up to the cursor whenever the previous key wasn't a prefix search | ZLE `history-beginning-search`, fish Up, PSReadLine |
@@ -217,8 +222,8 @@ the README; kept in both places deliberately.)
 | Multi-line prompts (`PS1` with newlines): the lines before the last paint once per region; only the final line is the repainted edit row | readline, zsh |
 | Robust escape decoding: unrecognized CSI sequences (SGR mouse reports, private modes) are consumed whole per ECMA-48 instead of leaking their tail into the buffer as typed text | readline, all modern |
 | Resize: width re-read on every repaint; a resize while idle at the prompt repaints within a poll tick (~200ms) | readline SIGWINCH, approximated without signals |
-| Key rebinding: `bind`/`unbind` accept readline key-spec spellings (`\C-x`, `\M-f`, `\e[1;5C`), remapping single keys to named `EditorAction`s; `bindings()` lists the effective keymap | readline `bind '"\C-x": kill-line'`, `bind -P`, `bind -r` |
-| Host-command bindings: `bind_host` + `Hooks::host_binding` — raw mode suspends, the host runs its command against the line/cursor, the edit resumes | bash `bind -x` (`READLINE_LINE`/`READLINE_POINT`) |
+| Key rebinding: `bind`/`unbind` accept readline key-spec spellings (`\C-x`, `\M-f`, `\e[1;5C`), remapping single keys to named `EditorAction`s; `bindings()` lists the effective keymap; `EditorAction::name`/`from_name` map actions to readline's command names so hosts don't keep their own table | readline `bind '"\C-x": kill-line'`, `bind -P`, `bind -r`, `rl_named_function` |
+| Host-command bindings: `bind_host` + `Hooks::host_binding` — raw mode suspends, the host runs its command against the line/cursor, the edit resumes; `host_bindings()` lists them | bash `bind -x`, `bind -X` (`READLINE_LINE`/`READLINE_POINT`) |
 | Readline variables: `set_completion_ignore_case`, `set_show_all_if_ambiguous`, `set_menu_complete`, `set_bell_style` | readline `set completion-ignore-case on` … |
 | Read deadline: `read_line_timeout` returns `ReadResult::TimedOut` when no complete line arrives in time | bash `$TMOUT`, readline `rl_set_timeout` |
 | History timestamps: `#<epoch>` comment lines, written only under `set_history_timestamps`, always parsed on load (both formats round-trip); `history_timestamps()` exposes them | bash `HISTTIMEFORMAT` file format |

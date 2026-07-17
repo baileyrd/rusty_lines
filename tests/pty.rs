@@ -402,6 +402,42 @@ fn multiline_prompt_prefix_paints_once_per_region() {
 }
 
 #[test]
+fn read_line_with_initial_seeds_buffer_and_cursor() {
+    // The initial example pre-seeds "hello " ∥ "world" with the cursor at
+    // the split; typing X then Enter must yield "hello Xworld".
+    let (master, mut child) = spawn_example("initial");
+    let mut m = std::fs::File::from(master.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    loop {
+        if strip_ansi(&out).contains("hello world") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "seeded line never painted:\n{}",
+            strip_ansi(&out)
+        );
+        drain(&master, &mut out, 100);
+    }
+    m.write_all(b"X\r").unwrap();
+    m.flush().unwrap();
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "initial demo did not exit");
+    }
+    child.wait().unwrap();
+    drain(&master, &mut out, 200);
+    let out = strip_ansi(&out);
+    assert!(
+        out.contains(&echo("hello Xworld")),
+        "cursor not at the seam:\n{out}"
+    );
+}
+
+#[test]
 fn read_line_timeout_expires_at_the_prompt() {
     // Sit at the timeout example's prompt without typing: the 2s deadline
     // must fire, print bash's message, and exit cleanly.
