@@ -64,3 +64,18 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup toolchain install 1.88 --profile minimal && rustup default 1.88
       - run: cargo check --locked --all-targets
+
+  bench:
+    # bench/ is deliberately not a workspace member (keeps the editor
+    # itself dependency-free), so nothing else here verifies it still
+    # builds against current rustyline/reedline releases or that its
+    # committed Cargo.lock stays valid. Build/lint only — not a full
+    # run, which needs a real pty and would add timing-sensitive
+    # flakiness to CI for no benefit; run it by hand to get numbers.
+    name: Check (bench/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable && rustup default stable && rustup component add clippy
+      - run: cargo build --locked --all-targets --manifest-path bench/Cargo.toml
+      - run: cargo clippy --locked --all-targets --manifest-path bench/Cargo.toml -- -D warnings

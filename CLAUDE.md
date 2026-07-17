@@ -39,9 +39,20 @@ Layers inside `read_line`, bottom to top:
   (including panics) restores the terminal.
 - **Key decoding**: UTF-8 assembly + CSI/SS3 escape parsing, with a short
   poll to distinguish a lone ESC from a sequence.
-- **Render engine**: full repaint of the edit region per keystroke;
+- **Render engine**: a full (not diffed) repaint of the edit region;
   display-width math is ANSI-aware and control chars render `^X`-style, so
   cursor math must stay exact — width bugs show up as misplaced cursors.
+  Not synchronously tied to every keystroke: the main loop coalesces —
+  skips a repaint when more input is already queued, since it would be
+  instantly overwritten by the next key's repaint anyway (readline's
+  trick, capped so a very large flood still shows periodic progress).
+  `LineState::render_owed` tracks a pending coalesced paint;
+  `finish_line` — the single choke point every exit path funnels
+  through — flushes it before computing cursor-repositioning math, which
+  would otherwise corrupt the display against stale row/column
+  bookkeeping. Any new path that can end a read (or otherwise assumes
+  the terminal cursor matches `painted_rows`/`painted_cursor_row`) must
+  go through `finish_line`, not print directly.
 - **Keymaps**: emacs by default, vi when `Hooks::vi_mode()` is true
   (checked live per `read_line`, no editor rebuild).
 - **History**: multi-line entries are stored joined with `; ` (bash
