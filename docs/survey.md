@@ -188,7 +188,7 @@ the README; kept in both places deliberately.)
 | Kill ring: C-k, C-u, C-w, M-d, M-Backspace kill *into* a ring; C-y yanks; M-y rotates; consecutive kills grow one entry (append forward / prepend backward); ring survives across lines; depth configurable (`set_max_kill_ring_len`, and `set_max_undo_len` for undo) | readline, ZLE, fish |
 | More kill/delete commands: `kill-whole-line` (unbound, like readline) and `delete-horizontal-space` (M-\, a delete — nothing enters the ring) | readline |
 | Operate-and-get-next: C-o accepts the line and pre-loads the next `read_line` with the history entry after it, for replaying command sequences; the recalled entry is re-located by content if `erasedups` or a host history edit shifted indices in between | readline `operate-and-get-next`, bash |
-| Pre-seeded lines: `read_line_with_initial((left, right))` starts the edit with text in the buffer and the cursor between the halves — `fc`-style edit-and-rerun, offered corrections | rustyline `readline_with_initial`, zsh `print -z` |
+| Pre-seeded lines: `read_line_with_initial((left, right))` starts the edit with text in the buffer and the cursor between the halves — `fc`-style edit-and-rerun, offered corrections; combinable with the deadline via `read_line_with_initial_timeout` | rustyline `readline_with_initial`, zsh `print -z` |
 | Word flavors: M-b/M-f/M-d/M-Backspace use alphanumeric words, C-w whitespace words (unix-word-rubout) | readline's two word classes |
 | Ctrl-arrow / Alt-arrow word motion (`CSI 1;5C` etc.) | every modern terminal editor |
 | Undo: C-_ , C-x C-u (and C-z, fish-style); runs of self-insert *and of single-character deletes* undo in groups of at most 20 characters (readline's chunking); M-r reverts the whole line | readline (incl. `revert-line`), ZLE, fish |
@@ -197,13 +197,13 @@ the README; kept in both places deliberately.)
 | Insert last argument: M-. / M-_ , repeat cycles older entries | readline, ZLE |
 | Quoted insert: C-v / C-q; control chars render `^X`-style | readline |
 | Edit line in `$VISUAL`/`$EDITOR`: C-x C-e (emacs), `v` (vi normal); result returned as the line | readline, ZLE, fish (Alt-e) |
-| History: Up/Down with draft preservation, C-p/C-n, M-< / M-> | readline |
+| History: Up/Down with draft preservation, C-p/C-n, M-< / M->; in-session edits to recalled entries survive navigating away and back, reverting once the line is accepted | readline; zsh (edit persistence scope) |
 | History cap: `set_max_history_len` drops oldest past the limit | readline `stifle_history`, bash `HISTSIZE` |
 | History dedup option: `set_history_dedup` erases earlier duplicates | bash `HISTCONTROL=erasedups`, fish |
 | History ignore-space option: `set_history_ignore_space` skips lines starting with a space | bash `HISTCONTROL=ignorespace`, zsh `HIST_IGNORE_SPACE` |
 | History persistence: `save_history` rewrites atomically (temp file + rename) and creates the file mode 0600, `append_history` appends only new entries; `load_history` tolerates a rustyline `#V2` header, and `#<digits>` *comment entries* round-trip (only epoch-scale, paired stamps parse as timestamps) | bash `histappend` and its 0600 history file; rustyline migration |
 | Clear screen: C-l clears and repaints the edit region at the top | readline `clear-screen` |
-| Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search; starts from the current history position after an unedited recall; a paste types into the query; a miss shows `(failed reverse-i-search)` and rings the bell, keeping the last match visible; leaving the search puts the cursor *on* the match (readline's point) | readline, ZLE (bash paste-into-query) |
+| Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search; starts from the current history position after an unedited recall and the found entry *becomes* the position on exit; a paste types into the query; a miss shows `(failed reverse-i-search)` and rings the bell, keeping the last match visible; leaving the search puts the cursor *on* the match (readline's point); C-g aborts with a bell, C-c aborts the whole read | readline, ZLE (bash paste-into-query, `^C` abort) |
 | Case-insensitive search option: `set_search_ignore_case` covers incremental *and* prefix search | readline 8.1 `search-ignore-case` |
 | Bell on failed operations: no-match completion, history past either end, failed prefix search, failed vi find — all per `set_bell_style` | readline `bell-style` |
 | Prefix history search: PageUp/PageDown, M-p/M-n; the prefix re-anchors on the buffer up to the cursor whenever the previous key wasn't a prefix search | ZLE `history-beginning-search`, fish Up, PSReadLine |

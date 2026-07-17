@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- In-session history edits survive navigation: change a recalled entry,
+  move away with Up/Down/M-</M->/prefix search/vi `G`, come back — the
+  edit is still there (zsh's scope: everything reverts once a line is
+  accepted, since the overlay lives per `read_line`). Previously every
+  navigation re-cloned the original and the edit was lost.
+- Leaving incremental search on a hit now *moves the history position*
+  to the found entry, so a following Up walks backward from there
+  (readline); the overlay for that entry is re-anchored to the matched
+  original text.
+- Abort semantics: C-c during incremental search aborts the whole read
+  (bash's `^C` + fresh prompt) instead of merely leaving search mode;
+  C-g/Esc abort the search with readline's bell; and C-g in normal
+  editing is now readline's `abort` command (`EditorAction::Abort`,
+  bell) instead of an unbound no-op — a host rebinding C-g (e.g. to a
+  `bind -x` command) shadows it as before.
+- The non-Unix fallback prints its prompt to stderr, matching the Unix
+  plain path (bash's rule — the prompt is a conversation with the
+  user, not output).
+- `save_history` syncs the parent directory after the atomic rename
+  (best-effort), so a crash immediately after saving can't resurrect
+  the old file from an unsynced directory entry.
+- New `read_line_with_initial_timeout`: the deadline and the pre-seeded
+  buffer combined, so a `$TMOUT` host doesn't give up seeding.
+- First end-to-end multibyte coverage: pty tests type CJK and accented
+  text and edit through it (input assembly, double-width cursor math,
+  word kills); a pty test pins the history-edit persistence; the chaos
+  loop now feeds `visualize_marked` random mark offsets.
+- Compile-time `Send`/`Sync` guarantees on the public types (`Editor`,
+  `ReadResult`, `Candidate`, `EditorAction`, `NoHooks`) — hosts move
+  the editor across threads; a refactor can't silently break that.
+- The remaining `Vec`-collecting text helpers (`vi_word_back`,
+  `vi_word_end`, `transpose_words`) became iterator walks — no more
+  per-keystroke line copies in vi mode and M-t.
+- README: the intro no longer claims the crate always uses `libc` —
+  Linux defaults to the zero-third-party-code `rusty_libc` backend
+  (true since 0.2.0); the try-it line lists the grown example set.
+
 ## 0.3.0 — 2026-07-17
 
 - Fix: EOF on stdin with text pending returned `Eof` and discarded the
