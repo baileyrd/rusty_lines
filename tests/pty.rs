@@ -353,6 +353,41 @@ fn possible_completions_lists_without_editing() {
 }
 
 #[test]
+fn wide_char_editing_keeps_cursor_math() {
+    // Double-width CJK through the whole pipeline: UTF-8 input assembly,
+    // width math, and editing at the start of the line. C-a then C-d
+    // deletes the first wide character.
+    let out = run_session(&["日本ab".as_bytes(), b"\x01", b"\x04", b"\r"]);
+    assert!(out.contains(&echo("本ab")), "wide-char edit wrong:\n{out}");
+    // And word ops over multibyte text: C-w kills the accented word.
+    let out = run_session(&["héllo wörld".as_bytes(), b"\x17", b"\r"]);
+    assert!(
+        out.contains(&echo("héllo ")),
+        "multibyte word kill wrong:\n{out}"
+    );
+}
+
+#[test]
+fn history_edits_survive_navigation() {
+    // Recall "one" (two Ups), append "X", go Up to "two"... wait — Up
+    // from the older entry goes older; use Down then Up instead: edit
+    // "one", Down to "two", Up again — the edit must still be there
+    // (zsh keeps in-session edits until accept).
+    let out = run_session(&[
+        b"one\r",
+        b"two\r",
+        b"\x1b[A\x1b[A", // Up Up -> "one"
+        b"X",            // edit it -> "oneX"
+        b"\x1b[B\x1b[A", // Down to "two", back Up
+        b"\r",
+    ]);
+    assert!(
+        out.contains(&echo("oneX")),
+        "history edit lost on navigation:\n{out}"
+    );
+}
+
+#[test]
 fn vi_normal_mode_edits_and_shows_the_mode() {
     // "xhello", Esc into normal mode, `0` to column 0, `x` deletes the
     // stray character, Enter accepts from normal mode.

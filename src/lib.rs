@@ -283,6 +283,10 @@ pub enum EditorAction {
     /// default M-C-] isn't a decodable chord here, but `bind` can place
     /// it anywhere).
     CharacterSearchBackward,
+    /// Ring the bell and do nothing else — readline's `abort` (C-g);
+    /// pending states like an armed completion menu are already cleared
+    /// by any non-completing key.
+    Abort,
     /// Insert the next key literally (`quoted-insert`, C-v/C-q).
     QuotedInsert,
     /// Edit the line in `$VISUAL`/`$EDITOR` and execute the result
@@ -346,6 +350,7 @@ impl EditorAction {
             EditorAction::InsertCompletions => "insert-completions",
             EditorAction::CharacterSearch => "character-search",
             EditorAction::CharacterSearchBackward => "character-search-backward",
+            EditorAction::Abort => "abort",
             EditorAction::QuotedInsert => "quoted-insert",
             EditorAction::EditAndExecuteCommand => "edit-and-execute-command",
         }
@@ -402,6 +407,7 @@ impl EditorAction {
             "insert-completions" => EditorAction::InsertCompletions,
             "character-search" => EditorAction::CharacterSearch,
             "character-search-backward" => EditorAction::CharacterSearchBackward,
+            "abort" => EditorAction::Abort,
             "quoted-insert" => EditorAction::QuotedInsert,
             "edit-and-execute-command" => EditorAction::EditAndExecuteCommand,
             _ => return None,
@@ -1100,6 +1106,21 @@ impl Editor {
         self.read_line_inner(prompt, rprompt, hooks, None, Some(initial))
     }
 
+    /// The full-form read: both a deadline and a pre-seeded buffer —
+    /// [`read_line_timeout`](Editor::read_line_timeout) and
+    /// [`read_line_with_initial`](Editor::read_line_with_initial)
+    /// combined, so a `$TMOUT` host doesn't have to give up seeding.
+    pub fn read_line_with_initial_timeout(
+        &mut self,
+        prompt: &str,
+        rprompt: &str,
+        hooks: &dyn Hooks,
+        initial: (&str, &str),
+        timeout: Option<std::time::Duration>,
+    ) -> io::Result<ReadResult> {
+        self.read_line_inner(prompt, rprompt, hooks, timeout, Some(initial))
+    }
+
     fn read_line_inner(
         &mut self,
         prompt: &str,
@@ -1132,8 +1153,11 @@ impl Editor {
             // captured output.
             let _ = (rprompt, hooks);
             if std::io::IsTerminal::is_terminal(&io::stdin()) {
-                write!(io::stdout(), "{prompt}")?;
-                io::stdout().flush()?;
+                // The prompt goes to stderr, mirroring the Unix plain
+                // path (bash's rule): stdout may be redirected, and the
+                // prompt is a conversation with the user, not output.
+                write!(io::stderr(), "{prompt}")?;
+                io::stderr().flush()?;
             }
             let mut line = String::new();
             if io::stdin().read_line(&mut line)? == 0 {
@@ -1169,7 +1193,16 @@ fn write_history_atomic(path: &std::path::Path, data: &[u8]) -> io::Result<()> {
         }
         f.write_all(data)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        // The rename itself lives in the directory entry: sync the
+        // parent too, or a crash right here can resurrect the old file.
+        // (Best-effort — opening a directory read-only fails on some
+        // platforms, and the data is already safe in the temp file.)
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+        if let Ok(d) = std::fs::File::open(dir.unwrap_or(std::path::Path::new("."))) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -1427,6 +1460,7 @@ static DEFAULT_BINDINGS: &[(Key, EditorAction)] = &[
     (Key::Alt('?'), EditorAction::PossibleCompletions),
     (Key::Alt('*'), EditorAction::InsertCompletions),
     (Key::Ctrl(']'), EditorAction::CharacterSearch),
+    (Key::Ctrl('g'), EditorAction::Abort),
     (Key::Ctrl('v'), EditorAction::QuotedInsert),
     (Key::Ctrl('q'), EditorAction::QuotedInsert),
 ];
@@ -1959,6 +1993,11 @@ struct LineState<'a> {
     hist_index: Option<usize>,
     draft: String,
     prefix: String,
+    /// In-session edits to recalled history entries: navigating away
+    /// from a modified entry stashes it here, and coming back restores
+    /// it — zsh's behavior (edits revert once the line is accepted,
+    /// since this lives per `read_line`).
+    hist_edits: std::collections::HashMap<usize, String>,
     /// vi mode: true when in normal mode; `vi_op` holds a pending
     /// `d`/`c`/`y` operator, `vi_find` a pending `f F t T`, `vi_count`
     /// the accumulated count, `vi_replace` a pending `r`, `last_find`
@@ -2078,6 +2117,7 @@ fn read_line_raw(
         hist_index: None,
         draft: String::new(),
         prefix: String::new(),
+        hist_edits: std::collections::HashMap::new(),
         vi: hooks.vi_mode(),
         vi_normal: false,
         vi_count: 0,
@@ -2182,6 +2222,10 @@ fn read_line_raw(
                 SearchOutcome::Accept => {
                     finish_line(&mut st)?;
                     return Ok(ReadResult::Line(st.buffer));
+                }
+                SearchOutcome::Interrupt => {
+                    finish_line(&mut st)?;
+                    return Ok(ReadResult::Interrupted);
                 }
             }
         }
@@ -2652,7 +2696,7 @@ fn run_action(
         }
         EditorAction::InsertLastArgument => insert_last_arg(st, history),
         EditorAction::BeginningOfHistory => history_first(st, history),
-        EditorAction::EndOfHistory => history_last(st),
+        EditorAction::EndOfHistory => history_last(st, history),
         EditorAction::PreviousHistory => history_prev(st, history),
         EditorAction::NextHistory => history_next(st, history),
         EditorAction::HistorySearchBackward => history_prefix_prev(st, history),
@@ -2714,6 +2758,7 @@ fn run_action(
         }
         EditorAction::CharacterSearch => character_search(st, false)?,
         EditorAction::CharacterSearchBackward => character_search(st, true)?,
+        EditorAction::Abort => bell(st.cfg.bell)?,
         EditorAction::QuotedInsert => quoted_insert(st)?,
     }
     Ok(AfterKey::Done)
@@ -2986,11 +3031,12 @@ fn handle_vi_normal(st: &mut LineState, key: Key, history: &[String], ring: &mut
                 } else {
                     history.len() - 1
                 };
+                stash_hist_edit(st, history);
                 if st.hist_index.is_none() {
                     st.draft = st.buffer.clone();
                 }
                 st.hist_index = Some(idx);
-                st.buffer = history[idx].clone();
+                st.buffer = hist_entry(st, history, idx);
                 st.cursor = st.buffer.len();
             }
         }
@@ -3099,6 +3145,9 @@ enum SearchOutcome {
     Continue,
     Accept,
     Exit,
+    /// C-c during the search: abort the whole read (bash prints `^C`
+    /// and gives a fresh prompt), not just the search.
+    Interrupt,
 }
 
 /// Ctrl-R/Ctrl-S incremental search (bash's `(reverse-i-search)`); C-r
@@ -3113,17 +3162,30 @@ fn handle_search_key(
     let search = st.search.as_mut().expect("search active");
     match key {
         Key::Enter => {
-            if let Some(hit) = search.hit {
+            let (hit, query) = (search.hit, search.query.clone());
+            if let Some(hit) = hit {
+                stash_hist_edit(st, history);
+                // The found entry becomes the history position, so a
+                // following Up walks backward from here (readline), and
+                // it re-anchors on the original text.
+                st.hist_edits.remove(&hit);
+                st.hist_index = Some(hit);
                 st.buffer = history[hit].clone();
                 // The cursor lands on the match, like readline's point.
-                st.cursor = match_pos(&st.buffer, &search.query, ci).unwrap_or(st.buffer.len());
+                st.cursor = match_pos(&st.buffer, &query, ci).unwrap_or(st.buffer.len());
             }
             st.search = None;
             return Ok(SearchOutcome::Accept);
         }
-        Key::Ctrl('g') | Key::Esc | Key::Ctrl('c') => {
+        Key::Ctrl('g') | Key::Esc => {
+            // Abort: back to the pre-search line, with readline's bell.
             st.search = None;
+            bell(st.cfg.bell)?;
             return Ok(SearchOutcome::Exit);
+        }
+        Key::Ctrl('c') => {
+            st.search = None;
+            return Ok(SearchOutcome::Interrupt);
         }
         Key::Ctrl('r') => {
             // Next older match.
@@ -3176,10 +3238,14 @@ fn handle_search_key(
             // Any other key: keep the match as the edit buffer and leave
             // search mode, the cursor on the matched text (readline
             // leaves point at the found location — you searched for it
-            // to edit it).
-            if let Some(hit) = search.hit {
+            // to edit it). The hit becomes the history position.
+            let (hit, query) = (search.hit, search.query.clone());
+            if let Some(hit) = hit {
+                stash_hist_edit(st, history);
+                st.hist_edits.remove(&hit);
+                st.hist_index = Some(hit);
                 st.buffer = history[hit].clone();
-                st.cursor = match_pos(&st.buffer, &search.query, ci).unwrap_or(st.buffer.len());
+                st.cursor = match_pos(&st.buffer, &query, ci).unwrap_or(st.buffer.len());
             }
             st.search = None;
             return Ok(SearchOutcome::Exit);
@@ -3412,21 +3478,29 @@ fn vi_word_fwd(s: &str, pos: usize) -> usize {
     it.peek().map(|&(i, _)| pos + i).unwrap_or(s.len())
 }
 
-/// vi `b`: start of the small word before `pos`.
+/// vi `b`: start of the small word before `pos` — a reverse walk, no
+/// per-keystroke `Vec` of the line.
 fn vi_word_back(s: &str, pos: usize) -> usize {
-    let chars: Vec<(usize, char)> = s[..pos].char_indices().collect();
-    let mut i = chars.len();
-    while i > 0 && vi_class(chars[i - 1].1) == 0 {
-        i -= 1;
+    let mut it = s[..pos].char_indices().rev();
+    let mut cur = it.next();
+    while let Some((_, c)) = cur {
+        if vi_class(c) != 0 {
+            break;
+        }
+        cur = it.next();
     }
-    if i == 0 {
+    let Some((mut boundary, c0)) = cur else {
         return 0;
+    };
+    let cls = vi_class(c0);
+    while let Some((i, c)) = cur {
+        if vi_class(c) != cls {
+            break;
+        }
+        boundary = i;
+        cur = it.next();
     }
-    let cls = vi_class(chars[i - 1].1);
-    while i > 0 && vi_class(chars[i - 1].1) == cls {
-        i -= 1;
-    }
-    chars.get(i).map(|&(b, _)| b).unwrap_or(0)
+    boundary
 }
 
 /// vi `e`: byte index of the last character of the current/next small
@@ -3435,22 +3509,24 @@ fn vi_word_end(s: &str, pos: usize) -> usize {
     let Some(start) = s[pos..].chars().next().map(|c| pos + c.len_utf8()) else {
         return pos;
     };
-    let chars: Vec<(usize, char)> = s[start..]
+    let mut it = s[start..]
         .char_indices()
         .map(|(i, c)| (start + i, c))
-        .collect();
-    let mut i = 0;
-    while i < chars.len() && vi_class(chars[i].1) == 0 {
-        i += 1;
+        .peekable();
+    while it.peek().is_some_and(|&(_, c)| vi_class(c) == 0) {
+        it.next();
     }
-    if i >= chars.len() {
+    let Some(&(first, c0)) = it.peek() else {
         return pos;
-    }
-    let cls = vi_class(chars[i].1);
-    let mut last = chars[i].0;
-    while i < chars.len() && vi_class(chars[i].1) == cls {
-        last = chars[i].0;
-        i += 1;
+    };
+    let cls = vi_class(c0);
+    let mut last = first;
+    while let Some(&(i, c)) = it.peek() {
+        if vi_class(c) != cls {
+            break;
+        }
+        last = i;
+        it.next();
     }
     last
 }
@@ -3654,25 +3730,21 @@ fn transpose(st: &mut LineState) {
 /// leaving the cursor after the moved pair.
 #[cfg(unix)]
 fn transpose_words(st: &mut LineState) {
-    let e2 = word_forward_alnum(&st.buffer, st.cursor);
-    let s2 = {
-        let chars: Vec<(usize, char)> = st.buffer[..e2].char_indices().collect();
-        let mut i = chars.len();
-        while i > 0 && chars[i - 1].1.is_alphanumeric() {
-            i -= 1;
+    // Start of the maximal run of `pred` characters ending at `from`.
+    fn run_start(s: &str, from: usize, pred: impl Fn(char) -> bool) -> usize {
+        let mut b = from;
+        for (i, c) in s[..from].char_indices().rev() {
+            if !pred(c) {
+                break;
+            }
+            b = i;
         }
-        chars.get(i).map(|&(b, _)| b).unwrap_or(e2)
-    };
-    let chars: Vec<(usize, char)> = st.buffer[..s2].char_indices().collect();
-    let mut i = chars.len();
-    while i > 0 && !chars[i - 1].1.is_alphanumeric() {
-        i -= 1;
+        b
     }
-    let e1 = if i < chars.len() { chars[i].0 } else { s2 };
-    while i > 0 && chars[i - 1].1.is_alphanumeric() {
-        i -= 1;
-    }
-    let s1 = chars.get(i).map(|&(b, _)| b).unwrap_or(e1);
+    let e2 = word_forward_alnum(&st.buffer, st.cursor);
+    let s2 = run_start(&st.buffer, e2, char::is_alphanumeric);
+    let e1 = run_start(&st.buffer, s2, |c| !c.is_alphanumeric());
+    let s1 = run_start(&st.buffer, e1, char::is_alphanumeric);
     if s1 >= e1 || s2 >= e2 || e1 > s2 {
         return;
     }
@@ -3869,8 +3941,33 @@ fn edit_in_editor(st: &mut LineState, raw: &RawMode) -> io::Result<Option<String
     }
 }
 
+/// Stash the buffer as an in-session edit of the current history entry
+/// (or clear a stale stash when the edit was reverted) before navigating
+/// away — so coming back shows the user's version, not the original.
+#[cfg(unix)]
+fn stash_hist_edit(st: &mut LineState, history: &[String]) {
+    if let Some(i) = st.hist_index {
+        if history.get(i) == Some(&st.buffer) {
+            st.hist_edits.remove(&i);
+        } else {
+            st.hist_edits.insert(i, st.buffer.clone());
+        }
+    }
+}
+
+/// The text to show for history entry `i`: the in-session edit if one
+/// exists, else the original.
+#[cfg(unix)]
+fn hist_entry(st: &LineState, history: &[String], i: usize) -> String {
+    st.hist_edits
+        .get(&i)
+        .cloned()
+        .unwrap_or_else(|| history[i].clone())
+}
+
 #[cfg(unix)]
 fn history_prev(st: &mut LineState, history: &[String]) {
+    stash_hist_edit(st, history);
     let next_index = match st.hist_index {
         None if history.is_empty() => {
             let _ = bell(st.cfg.bell); // nothing to recall
@@ -3887,19 +3984,20 @@ fn history_prev(st: &mut LineState, history: &[String]) {
         Some(i) => i - 1,
     };
     st.hist_index = Some(next_index);
-    st.buffer = history[next_index].clone();
+    st.buffer = hist_entry(st, history, next_index);
     st.cursor = st.buffer.len();
 }
 
 #[cfg(unix)]
 fn history_next(st: &mut LineState, history: &[String]) {
+    stash_hist_edit(st, history);
     match st.hist_index {
         None => {
             let _ = bell(st.cfg.bell); // already on the live draft
         }
         Some(i) if i + 1 < history.len() => {
             st.hist_index = Some(i + 1);
-            st.buffer = history[i + 1].clone();
+            st.buffer = hist_entry(st, history, i + 1);
             st.cursor = st.buffer.len();
         }
         Some(_) => {
@@ -3916,17 +4014,19 @@ fn history_first(st: &mut LineState, history: &[String]) {
     if history.is_empty() {
         return;
     }
+    stash_hist_edit(st, history);
     if st.hist_index.is_none() {
         st.draft = st.buffer.clone();
     }
     st.hist_index = Some(0);
-    st.buffer = history[0].clone();
+    st.buffer = hist_entry(st, history, 0);
     st.cursor = st.buffer.len();
 }
 
 /// M->: back to the live (draft) line.
 #[cfg(unix)]
-fn history_last(st: &mut LineState) {
+fn history_last(st: &mut LineState, history: &[String]) {
+    stash_hist_edit(st, history);
     if st.hist_index.is_some() {
         st.hist_index = None;
         st.buffer = std::mem::take(&mut st.draft);
@@ -3945,6 +4045,7 @@ fn history_prefix_prev(st: &mut LineState, history: &[String]) {
         st.prefix = st.buffer[..st.cursor].to_string();
     }
     st.this_action = Action::PrefixSearch;
+    stash_hist_edit(st, history);
     if st.hist_index.is_none() {
         st.draft = st.buffer.clone();
     }
@@ -3955,7 +4056,7 @@ fn history_prefix_prev(st: &mut LineState, history: &[String]) {
         .rposition(|h| starts_with_match(h, &st.prefix, ci) && *h != st.buffer)
     {
         st.hist_index = Some(i);
-        st.buffer = history[i].clone();
+        st.buffer = hist_entry(st, history, i);
         st.cursor = st.buffer.len();
     } else {
         let _ = bell(st.cfg.bell); // no earlier entry with this prefix
@@ -3966,6 +4067,7 @@ fn history_prefix_prev(st: &mut LineState, history: &[String]) {
 #[cfg(unix)]
 fn history_prefix_next(st: &mut LineState, history: &[String]) {
     st.this_action = Action::PrefixSearch;
+    stash_hist_edit(st, history);
     let Some(cur) = st.hist_index else { return };
     let ci = st.cfg.search_ignore_case;
     if let Some(off) = history[cur + 1..]
@@ -3974,7 +4076,7 @@ fn history_prefix_next(st: &mut LineState, history: &[String]) {
     {
         let i = cur + 1 + off;
         st.hist_index = Some(i);
-        st.buffer = history[i].clone();
+        st.buffer = hist_entry(st, history, i);
         st.cursor = st.buffer.len();
     } else {
         st.hist_index = None;
@@ -4381,6 +4483,7 @@ mod tests {
             hist_index: None,
             draft: String::new(),
             prefix: String::new(),
+            hist_edits: std::collections::HashMap::new(),
             vi: false,
             vi_normal: false,
             vi_count: 0,
@@ -5588,6 +5691,7 @@ mod tests {
             {
                 let col = (xorshift(&mut seed) % 40) as usize;
                 let _ = visualize(&s, col);
+                let _ = visualize_marked(&s, col, (xorshift(&mut seed) % 16) as usize);
                 let _ = visualize_keep_sgr(&s, col);
             }
             for i in (0..=s.len()).filter(|&i| s.is_char_boundary(i)) {
@@ -5783,6 +5887,79 @@ mod tests {
         let h: NoHooks = Default::default();
         let _copy = h;
         assert_eq!(format!("{h:?}"), "NoHooks");
+    }
+
+    #[test]
+    fn public_types_are_send_and_sync() {
+        // Hosts move the editor across threads (job control, async
+        // wrappers); a refactor must not silently break this.
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<Editor>();
+        assert_sync::<Editor>();
+        assert_send::<ReadResult>();
+        assert_send::<Candidate>();
+        assert_send::<EditorAction>();
+        assert_send::<NoHooks>();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_edits_stash_and_restore() {
+        let history = vec!["one".to_string(), "two".to_string()];
+        let mut st = state("draft", 5);
+        st.cfg.bell = BellStyle::None;
+        // Up to "two", edit it, Up to "one", back Down: edit preserved.
+        history_prev(&mut st, &history);
+        assert_eq!(st.buffer, "two");
+        st.buffer.push('X');
+        st.cursor = st.buffer.len();
+        history_prev(&mut st, &history);
+        assert_eq!(st.buffer, "one");
+        history_next(&mut st, &history);
+        assert_eq!(st.buffer, "twoX", "edit lost on navigation");
+        // Reverting the edit clears the stash.
+        st.buffer = "two".to_string();
+        history_prev(&mut st, &history);
+        history_next(&mut st, &history);
+        assert_eq!(st.buffer, "two");
+        // And the draft still comes back at the end.
+        history_next(&mut st, &history);
+        assert_eq!(st.buffer, "draft");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_moves_the_history_position_and_interrupts() {
+        let history = vec!["alpha".to_string(), "beta".to_string()];
+        // Exiting a search on a hit sets the history position there, so
+        // a following Up walks backward from the found entry.
+        let mut st = state("", 0);
+        st.cfg.bell = BellStyle::None;
+        start_search(&mut st, &history, false);
+        handle_search_key(&mut st, Key::Char('b'), &history).unwrap();
+        handle_search_key(&mut st, Key::Left, &history).unwrap();
+        assert_eq!(st.buffer, "beta");
+        assert_eq!(st.hist_index, Some(1));
+        history_prev(&mut st, &history);
+        assert_eq!(st.buffer, "alpha", "Up should continue from the hit");
+        // C-c during search aborts the whole read, like bash.
+        let mut st = state("", 0);
+        st.cfg.bell = BellStyle::None;
+        start_search(&mut st, &history, false);
+        let outcome = handle_search_key(&mut st, Key::Ctrl('c'), &history).unwrap();
+        assert!(matches!(outcome, SearchOutcome::Interrupt));
+        // C-g aborts just the search, restoring the pre-search line.
+        let mut st = state("mine", 4);
+        st.cfg.bell = BellStyle::None;
+        start_search(&mut st, &history, false);
+        handle_search_key(&mut st, Key::Char('b'), &history).unwrap();
+        let outcome = handle_search_key(&mut st, Key::Ctrl('g'), &history).unwrap();
+        assert!(matches!(outcome, SearchOutcome::Exit));
+        assert_eq!(st.buffer, "mine");
+        // And C-g in normal editing is readline's abort (named, bound).
+        assert_eq!(EditorAction::from_name("abort"), Some(EditorAction::Abort));
+        assert_eq!(default_action(&Key::Ctrl('g')), Some(EditorAction::Abort));
     }
 
     #[cfg(unix)]
