@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+- Operate-and-get-next (readline, bash C-o): `EditorAction::OperateAndGetNext`
+  accepts the line and pre-loads the next `read_line` with the history
+  entry after the one just executed, for replaying command sequences.
+- New named actions: `KillWholeLine` (unbound by default, like readline)
+  and `DeleteHorizontalSpace` (M-\; a delete, not a kill — readline's
+  spaces-and-tabs-around-point rule).
+- vi mode additions (vim semantics; readline `vi-fetch-history` for `G`):
+  `%` matching-bracket motion (inclusive under operators, both
+  directions), `G` fetches the most recent history entry — or entry N
+  with a count — and the `iw`/`aw` word text objects for `d`/`c`/`y`
+  (`diw`, `caw`, `yiw` …).
+- Mode indicator: `Editor::set_show_mode_in_prompt` prefixes readline's
+  default mode strings — `(ins)`/`(cmd)` in vi mode, `@` in emacs mode —
+  to the prompt (readline `show-mode-in-prompt`).
+- Completion listing matches readline more closely: candidates are
+  sorted and laid out column-major, and a list of
+  `completion-query-items` or more (default 100; 0 disables;
+  `set_completion_query_items`) asks `Display all N possibilities?
+  (y or n)` before printing.
+- Incremental search failure feedback: a query with no match shows
+  readline's `(failed reverse-i-search)` label, keeps the last match
+  visible, and rings the bell. The bell (still governed by
+  `set_bell_style`) now also rings on history motion past either end,
+  a failed prefix search, and a failed vi `f F t T ; ,` find.
+- History ignore-space option: `Editor::set_history_ignore_space` makes
+  `add_history_entry` skip lines starting with a space (bash
+  `HISTCONTROL=ignorespace`).
+- Kill-ring and undo depths are configurable (`set_max_kill_ring_len`,
+  `set_max_undo_len`; defaults unchanged at 32/200), and both now evict
+  in O(1) (`VecDeque`) instead of shifting the whole buffer per
+  keystroke once full.
+- `Hooks::hint` is now called at most once per keystroke (memoized on
+  the buffer content) instead of up to twice — render and the
+  Right/End/M-f accept paths share the cached value.
+- Fix: a bracketed paste in vi *normal* mode was silently discarded;
+  it now inserts literally at the cursor (vim, readline vi mode).
+- Fix: Ctrl-Space and Ctrl-\ / Ctrl-] / Ctrl-^ self-inserted raw
+  NUL/FS/GS/RS bytes into the buffer; they now decode as `\C-@`,
+  `\C-\\`, `\C-]`, `\C-^` — unbound by default but rebindable — and
+  `key_spec` escapes backslashes so such bindings round-trip.
+- Fix: the C-x C-e scratch file had a predictable name in a shared
+  `$TMPDIR` (symlink-attack window) and default permissions; it is now
+  created `O_EXCL` with an unpredictable name and mode 0600, and the
+  path is shell-quoted so a `$TMPDIR` with spaces works.
+- Fix: a stray UTF-8 continuation byte swallowed the next three
+  keystrokes as "continuations"; invalid lead bytes now become U+FFFD
+  immediately, and continuation reads are time-bounded.
+- Fix: the `read_line_timeout` deadline is now honored inside C-x
+  chords and quoted-insert (which block on their own follow-up key),
+  and half-delivered escape sequences / unterminated pastes give up
+  after a bounded wait instead of hanging the read.
+- Fix: the piped-stdin fallback (`read_line_plain`) left a trailing
+  `\r` on CRLF input; it now strips it, matching the non-Unix fallback.
 - Key rebinding API (revisiting a narrowing; rush's `bind` builtin):
   the emacs/vi-insert commands are now the public `EditorAction` enum,
   and `Editor::bind`/`unbind`/`bindings` remap single keys using
