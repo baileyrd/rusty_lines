@@ -49,7 +49,9 @@ full per-editor survey behind this table is in
 | Capability | Reference behavior |
 |---|---|
 | Emacs basics: C-a/C-e/C-b/C-f, C-d, C-h, C-t, arrows, Home/End/Delete | readline, everywhere |
-| Kill ring: C-k, C-u, C-w, M-d, M-Backspace kill *into* a ring; C-y yanks; M-y rotates; consecutive kills grow one entry (append forward / prepend backward); ring survives across lines | readline, ZLE, fish |
+| Kill ring: C-k, C-u, C-w, M-d, M-Backspace kill *into* a ring; C-y yanks; M-y rotates; consecutive kills grow one entry (append forward / prepend backward); ring survives across lines; depth configurable (`set_max_kill_ring_len`, and `set_max_undo_len` for undo) | readline, ZLE, fish |
+| More kill/delete commands: `kill-whole-line` (unbound, like readline) and `delete-horizontal-space` (M-\, a delete — nothing enters the ring) | readline |
+| Operate-and-get-next: C-o accepts the line and pre-loads the next `read_line` with the history entry after it, for replaying command sequences | readline `operate-and-get-next`, bash |
 | Word flavors: M-b/M-f/M-d/M-Backspace use alphanumeric words, C-w whitespace words (unix-word-rubout) | readline's two word classes |
 | Ctrl-arrow / Alt-arrow word motion (`CSI 1;5C` etc.) | every modern terminal editor |
 | Undo: C-_ , C-x C-u (and C-z, fish-style); runs of self-insert undo as one unit; M-r reverts the whole line | readline (incl. `revert-line`), ZLE, fish |
@@ -61,18 +63,21 @@ full per-editor survey behind this table is in
 | History: Up/Down with draft preservation, C-p/C-n, M-< / M-> | readline |
 | History cap: `set_max_history_len` drops oldest past the limit | readline `stifle_history`, bash `HISTSIZE` |
 | History dedup option: `set_history_dedup` erases earlier duplicates | bash `HISTCONTROL=erasedups`, fish |
+| History ignore-space option: `set_history_ignore_space` skips lines starting with a space | bash `HISTCONTROL=ignorespace`, zsh `HIST_IGNORE_SPACE` |
 | History persistence: `save_history` rewrites, `append_history` appends only new entries; `load_history` tolerates a rustyline `#V2` header | bash `histappend`; rustyline migration |
 | Clear screen: C-l clears and repaints the edit region at the top | readline `clear-screen` |
-| Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search | readline, ZLE |
+| Incremental search: C-r backward *and* C-s forward (IXON is off), direction switching mid-search; a miss shows `(failed reverse-i-search)` and rings the bell, keeping the last match visible | readline, ZLE |
+| Bell on failed operations: no-match completion, history past either end, failed prefix search, failed vi find — all per `set_bell_style` | readline `bell-style` |
 | Prefix history search: PageUp/PageDown, M-p/M-n | ZLE `history-beginning-search`, fish Up, PSReadLine |
 | History hints (autosuggestions) via `Hooks::hint`, Right/End accepts; M-f / Ctrl-Right at end of line accepts one word | fish, PSReadLine, linenoise hints |
 | Syntax highlighting while typing via `Hooks::highlight` | fish, ZLE plugins, replxx |
-| Tab completion via `Hooks::complete`: LCP insertion + columned candidate list | readline `CompletionType::List` |
+| Tab completion via `Hooks::complete`: LCP insertion + sorted, column-major candidate list; big lists ask `Display all N possibilities? (y or n)` first (`set_completion_query_items`, default 100) | readline `CompletionType::List`, `completion-query-items` |
 | Menu cycling: Tab after the candidate list walks the candidates in-line, wrapping around | zsh `AUTO_MENU`, readline `menu-complete` |
 | Abbreviation expansion on space via `Hooks::expand_abbreviation` | fish `abbr` |
 | Right-side prompt (second `read_line` argument), hidden when the line grows into it | zsh `$RPS1`, fish, reedline |
-| Bracketed paste: paste arrives as one event — tabs/ESC insert literally, nothing executes until Enter; multi-line pastes keep their newlines (shown `⏎`) and return as a unit; multi-line history entries stored joined with `; ` (bash `cmdhist`) | readline 8.1+, ZLE, fish, reedline |
-| vi mode (`Hooks::vi_mode`): counts; `d`/`c`/`y` operators over motions; `h l 0 ^ $ w W b B e E f F t T ; ,`; `x X D C s S Y r ~ p P u`; `i I a A`; `k`/`j` history; `cw`≡`ce` quirk; Esc backs the cursor up one | readline vi mode, ksh, ZLE |
+| Bracketed paste: paste arrives as one event — tabs/ESC insert literally, nothing executes until Enter; inserts literally in vi normal mode too; multi-line pastes keep their newlines (shown `⏎`) and return as a unit; multi-line history entries stored joined with `; ` (bash `cmdhist`) | readline 8.1+, ZLE, fish, reedline |
+| vi mode (`Hooks::vi_mode`): counts; `d`/`c`/`y` operators over motions; `h l 0 ^ $ w W b B e E f F t T ; , %`; the `iw`/`aw` text objects; `x X D C s S Y r ~ p P u`; `i I a A`; `k`/`j` history, `G` fetches by count; `cw`≡`ce` quirk; Esc backs the cursor up one | readline vi mode, ksh, ZLE; vim (`%`, `G`, `iw`/`aw`) |
+| Mode indicator: `set_show_mode_in_prompt` prefixes `(ins)`/`(cmd)` (vi) or `@` (emacs) to the prompt | readline `show-mode-in-prompt` and its default mode strings |
 | Wide chars + UTF-8 input assembly; ANSI-aware width math; soft-wrap repaint; `^X` control-char visualization keeps cursor math exact | all modern |
 | Resize: width re-read on every repaint; a resize while idle at the prompt repaints within a poll tick (~200ms) | readline SIGWINCH, approximated without signals |
 | Key rebinding: `bind`/`unbind` accept readline key-spec spellings (`\C-x`, `\M-f`, `\e[1;5C`), remapping single keys to named `EditorAction`s; `bindings()` lists the effective keymap | readline `bind '"\C-x": kill-line'`, `bind -P`, `bind -r` |
@@ -106,8 +111,9 @@ either niche, terminal-hostile, or a different program's job:
   insert mode; the unnamed register is the kill ring).
 - **Completion paging and menu-select UI** (fish's pager, ZLE's
   interactive menu with a highlighted selection): long candidate lists
-  print unpaged; repeated-Tab cycling (see the matrix) stands in for
-  menu-select.
+  print unpaged — though readline's `completion-query-items` y/n guard
+  (see the matrix) asks before dumping a big one; repeated-Tab cycling
+  stands in for menu-select.
 - **Signal-driven resize repaint** (readline installs a SIGWINCH
   handler). The width is re-read from the tty on every repaint, and a
   resize while idle at the prompt is noticed by the input poll tick and

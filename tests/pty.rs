@@ -224,6 +224,21 @@ fn up_arrow_recalls_history() {
 }
 
 #[test]
+fn ctrl_o_operate_and_get_next_replays_history() {
+    // Recall "one" with two Ups, then C-o: it executes "one" and
+    // pre-loads "two" on the next prompt, so a bare Enter replays it.
+    let out = run_session(&[b"one\r", b"two\r", b"\x1b[A\x1b[A", b"\x0f", b"\r"]);
+    assert!(
+        out.matches(&echo("one")).count() >= 2,
+        "C-o did not execute the recalled line:\n{out}"
+    );
+    assert!(
+        out.matches(&echo("two")).count() >= 2,
+        "next history entry not pre-loaded after C-o:\n{out}"
+    );
+}
+
+#[test]
 fn ctrl_c_interrupts_the_line() {
     let out = run_session(&[b"doomed", b"\x03"]);
     assert!(out.contains("^C"), "^C marker missing:\n{out}");
