@@ -17,17 +17,17 @@ publish = false
 unicode-width = "0.2"
 
 [features]
-# The terminal surface (termios/poll/read/winsize) is backed by the hand-rolled
-# raw-syscall crate by default. That is Linux-only, so the backend is actually
-# chosen by target: `rusty_libc` on Linux, the `libc` crate on other Unix (see
-# the cfgs in `term_sys.rs`). `libc-backend` is an escape hatch to force the
-# libc backend on Linux too (`--no-default-features --features libc-backend`).
+# The Unix terminal surface (termios/poll/read/winsize) is backed by the
+# hand-rolled raw-syscall crate by default. That is Linux-only, so the
+# backend is actually chosen by target: `rusty_libc` on Linux, the `libc`
+# crate on other Unix (see the cfgs in `term_sys.rs`). `libc-backend` is an
+# escape hatch to force the libc backend on Linux too
+# (`--no-default-features --features libc-backend`). Windows always uses
+# `rusty_win32` — there is no equivalent escape hatch there, since it's the
+# only backend this crate has for that platform.
 default = ["rusty-libc"]
 rusty-libc = ["dep:rusty_libc"]
 libc-backend = ["dep:libc"]
-
-# Raw terminal mode (termios), poll, and window size are Unix-only. Non-Unix
-# builds fall back to a plain buffered read and need neither backend.
 
 # Linux: `rusty_libc` is the default backend; `libc` only when forced.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -38,6 +38,13 @@ libc = { version = "0.2", optional = true }
 # Linux-only — so libc is a plain dependency there.
 [target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
 libc = "0.2"
+
+# Windows: GetConsoleMode/SetConsoleMode/ReadFile/WaitForSingleObject/
+# GetConsoleScreenBufferInfo via `rusty_win32` — the Windows counterpart of
+# the Unix termios/poll/read/winsize surface above (see `term_sys.rs`'s
+# Windows backend).
+[target.'cfg(windows)'.dependencies]
+rusty_win32 = { git = "https://github.com/baileyrd/rusty_win32", branch = "main", features = ["std"] }
 
 # The pty end-to-end tests (tests/pty.rs) drive examples/demo under a
 # pseudo-terminal.

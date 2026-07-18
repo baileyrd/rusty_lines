@@ -1,24 +1,38 @@
 //! Terminal syscall facade.
 //!
-//! The line editor needs a small, fixed slice of the Unix terminal API:
-//! `isatty`, `tcgetattr`/`tcsetattr`, a raw-mode flag flip, `poll`, a raw
-//! byte `read`, and the window size. Two backends provide it behind one
-//! interface:
+//! The line editor needs a small, fixed slice of terminal API: `isatty`,
+//! get/set the raw-mode-relevant attributes, a raw-mode flag flip, poll for
+//! input readiness, a raw byte read, and the window size. Three backends
+//! provide it behind one interface:
 //!
 //! - **`rusty_libc`** — the hand-rolled raw-syscall crate; the default on
 //!   Linux (zero third-party deps).
 //! - **`libc` crate** — the backend on other Unix, and on Linux when forced
 //!   with `--no-default-features --features libc-backend`.
+//! - **`rusty_win32`** — `GetConsoleMode`/`SetConsoleMode`/`ReadFile`/
+//!   `WaitForSingleObject`/`GetConsoleScreenBufferInfo` on Windows, the
+//!   direct analog of `tcgetattr`/`tcsetattr`/`poll`/`read`/`TIOCGWINSZ` —
+//!   not ConPTY (`CreatePseudoConsole`), which hosts a *child* process's
+//!   console session rather than this process's own inherited one. This
+//!   module decides what "raw mode" means in terms of `rusty_win32`'s mode
+//!   bits (which to clear/set); `rusty_win32` itself is policy-free, the
+//!   same way the `libc`/`rusty_libc` backends decide the termios raw-mode
+//!   recipe rather than baking it into those crates.
 //!
-//! All functions target the streams the editor uses directly: stdin (fd 0)
-//! for input and raw mode, stdout (fd 1) for the window size.
+//! All functions target the streams the editor uses directly: stdin for
+//! input and raw mode, stdout for the window size (and, on Windows, output
+//! VT processing — Windows tracks input/output console modes separately,
+//! unlike a single Unix `termios` covering both, so the Windows backend's
+//! `Termios` bundles both into one value to keep this interface uniform
+//! across backends).
 //!
 //! ## errno note
 //!
 //! `rusty_libc` does not write glibc's TLS `errno`, so `Error::last_os_error`
 //! is meaningless after its calls. This facade therefore builds every
 //! `io::Error` from the syscall's own return/`Errno`, so callers keep getting
-//! a correct `ErrorKind` (notably `Interrupted` for `EINTR`) in both backends.
+//! a correct `ErrorKind` (notably `Interrupted` for `EINTR`) in every
+//! backend.
 
 pub use imp::*;
 
@@ -272,5 +286,226 @@ mod imp {
     /// Turn terminal echo off in an attribute set (`stty -echo`'s bit).
     pub fn clear_echo_flag(t: &mut Termios) {
         t.c_lflag &= !termios::ECHO;
+    }
+}
+
+// ---- rusty_win32 backend: Windows -----------------------------------------
+#[cfg(windows)]
+mod imp {
+    use rusty_win32::console::{
+        ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    };
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+
+    /// Windows tracks input and output console modes as two independent
+    /// `DWORD`s (`GetConsoleMode` on the stdin handle vs. the stdout
+    /// handle), unlike a single Unix `termios` covering both — bundled into
+    /// one value here so the rest of this facade's interface (and every
+    /// call site in `lib.rs`) stays identical across backends.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Termios {
+        input_mode: u32,
+        output_mode: u32,
+    }
+
+    fn stdin_handle() -> rusty_win32::RawHandle {
+        io::stdin().as_raw_handle() as rusty_win32::RawHandle
+    }
+
+    fn stdout_handle() -> rusty_win32::RawHandle {
+        io::stdout().as_raw_handle() as rusty_win32::RawHandle
+    }
+
+    fn to_io(e: rusty_win32::Win32Error) -> io::Error {
+        e.into()
+    }
+
+    /// Is stdin a terminal? `std::io::IsTerminal` already handles this
+    /// portably (it resolves to `GetConsoleMode` succeeding under the
+    /// hood on Windows) — no `rusty_win32` call needed.
+    pub fn isatty_stdin() -> bool {
+        io::IsTerminal::is_terminal(&io::stdin())
+    }
+
+    /// Is stdout a terminal? The editor paints on stdout, so raw-mode
+    /// editing needs it to be one just as much as stdin.
+    pub fn isatty_stdout() -> bool {
+        io::IsTerminal::is_terminal(&io::stdout())
+    }
+
+    /// Read stdin's console input mode and stdout's console output mode —
+    /// the Windows analog of `tcgetattr`, bundled per the module doc note.
+    pub fn tcgetattr_stdin() -> io::Result<Termios> {
+        // SAFETY: both handles come from `AsRawHandle` on this process's
+        // own open stdin/stdout, valid for the duration of this call.
+        let input_mode =
+            unsafe { rusty_win32::console::get_mode(stdin_handle()) }.map_err(to_io)?;
+        // SAFETY: see above.
+        let output_mode =
+            unsafe { rusty_win32::console::get_mode(stdout_handle()) }.map_err(to_io)?;
+        Ok(Termios {
+            input_mode,
+            output_mode,
+        })
+    }
+
+    /// Apply `t`'s modes to stdin's console input mode and stdout's console
+    /// output mode — the Windows analog of `tcsetattr`. Windows console
+    /// mode changes take effect immediately; there's no `TCSADRAIN`-style
+    /// drain-first mode to opt into or out of.
+    pub fn tcsetattr_stdin_drain(t: &Termios) -> io::Result<()> {
+        // SAFETY: `stdin_handle()`/`stdout_handle()` are this process's own
+        // open, valid handles; `t`'s fields are plain bitmasks Windows
+        // itself reported as valid via a prior `tcgetattr_stdin` (or a
+        // caller-derived variant of one).
+        unsafe { rusty_win32::console::set_mode(stdin_handle(), t.input_mode) }.map_err(to_io)?;
+        // SAFETY: see above.
+        unsafe { rusty_win32::console::set_mode(stdout_handle(), t.output_mode) }.map_err(to_io)?;
+        Ok(())
+    }
+
+    /// The editor's raw-mode recipe (Windows shape of the same intent as
+    /// the Unix backends' `apply_raw_flags`): no line buffering or echo
+    /// (`ENABLE_LINE_INPUT`/`ENABLE_ECHO_INPUT` off — the analogs of
+    /// `ICANON`/`ECHO`), Ctrl+C delivered as ordinary input instead of the
+    /// OS terminating the process (`ENABLE_PROCESSED_INPUT` off — the
+    /// analog of `ISIG`), the console's own Quick Edit mouse-selection UI
+    /// disabled (`ENABLE_QUICK_EDIT_MODE` off, gated by
+    /// `ENABLE_EXTENDED_FLAGS` on — a Windows-only concern with no Unix
+    /// analog), and VT/ANSI escape sequences flowing both directions
+    /// (`ENABLE_VIRTUAL_TERMINAL_INPUT`/`ENABLE_VIRTUAL_TERMINAL_PROCESSING`
+    /// on — what makes arrow keys arrive as bytes this crate's existing
+    /// CSI decoder already parses, and repaint escape sequences render).
+    /// Output stays otherwise cooked (`ENABLE_PROCESSED_OUTPUT` untouched),
+    /// matching the Unix backends' own "output processing is left on"
+    /// policy.
+    pub fn apply_raw_flags(t: &mut Termios) {
+        t.input_mode &= !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+        t.input_mode |= ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS;
+        t.input_mode &= !ENABLE_QUICK_EDIT_MODE;
+        t.output_mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    }
+
+    /// Does an attribute set still match the raw-mode recipe? What the
+    /// idle tick checks to heal the terminal after a host command that
+    /// reset the console mode (Windows' analog of the Unix backends'
+    /// external-`stty`/`SIGTSTP`-`SIGCONT` healing case).
+    pub fn is_raw(t: &Termios) -> bool {
+        t.input_mode & (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT) == 0
+            && t.input_mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0
+            && t.output_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0
+    }
+
+    /// Is a byte ready on stdin within `ms` milliseconds (`< 0` blocks
+    /// indefinitely, matching `poll(2)`'s `-1` convention the Unix
+    /// backends pass through directly)? `WaitForSingleObject` on a console
+    /// input handle becomes signaled once at least one unread input
+    /// record is queued — the Windows analog of `poll(POLLIN)` readiness.
+    /// Unlike the Unix backends, no `EINTR`-style retry loop is needed:
+    /// Windows waits aren't interrupted by an asynchronous signal the way
+    /// a POSIX blocking syscall is.
+    pub fn poll_stdin(ms: i32) -> bool {
+        let timeout = if ms < 0 { u32::MAX } else { ms as u32 };
+        // SAFETY: `stdin_handle()` is this process's own open, valid,
+        // waitable console input handle.
+        unsafe { rusty_win32::console::wait_readable(stdin_handle(), timeout) }.unwrap_or(false)
+    }
+
+    /// Read up to `buf.len()` bytes from stdin in one call: `Ok(0)` at EOF,
+    /// `Ok(n)` for `n` bytes read (may be less than `buf.len()`) — with
+    /// `ENABLE_VIRTUAL_TERMINAL_INPUT` set (always true whenever this is
+    /// called through the raw-mode path — see `apply_raw_flags`),
+    /// `ReadFile` on a console input handle delivers a VT/ANSI byte stream
+    /// the same shape as a Unix `read` on a raw-mode tty, letting a caller
+    /// collecting many bytes (a paste, a burst of escape sequences) pay
+    /// one call instead of one per byte, exactly like the Unix backends.
+    pub fn read_stdin_chunk(buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: `stdin_handle()` is this process's own open, valid
+        // handle; `buf` is a valid, writable buffer of its own stated
+        // length.
+        unsafe { rusty_win32::console::read(stdin_handle(), buf) }.map_err(to_io)
+    }
+
+    /// Terminal width in columns from stdout, if available and non-zero.
+    pub fn term_cols_stdout() -> Option<usize> {
+        term_size_stdout().map(|(cols, _)| cols as usize)
+    }
+
+    /// Terminal size from stdout as (columns, rows), if available and
+    /// non-zero in both dimensions — `GetConsoleScreenBufferInfo`'s visible
+    /// window, the Windows analog of `TIOCGWINSZ`.
+    pub fn term_size_stdout() -> Option<(u16, u16)> {
+        // SAFETY: `stdout_handle()` is this process's own open, valid
+        // console output handle.
+        match unsafe { rusty_win32::console::window_size(stdout_handle()) } {
+            Ok((cols, rows)) if cols > 0 && rows > 0 => Some((cols, rows)),
+            _ => None,
+        }
+    }
+
+    /// Turn terminal echo off in an attribute set (`stty -echo`'s Windows
+    /// analog — `ENABLE_ECHO_INPUT`).
+    pub fn clear_echo_flag(t: &mut Termios) {
+        t.input_mode &= !ENABLE_ECHO_INPUT;
+    }
+
+    // `apply_raw_flags`/`is_raw`/`clear_echo_flag` are pure bit-math over an
+    // in-memory `Termios` — no console handle, no FFI call — so they're
+    // testable on any CI runner regardless of console attachment, unlike
+    // the handle-taking functions above (already covered by `rusty_win32`'s
+    // own tests at the primitive layer, verified on real `windows-latest`
+    // CI in that crate).
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn apply_raw_flags_produces_a_state_is_raw_accepts() {
+            let mut t = Termios {
+                input_mode: 0,
+                output_mode: 0,
+            };
+            apply_raw_flags(&mut t);
+            assert!(is_raw(&t));
+        }
+
+        #[test]
+        fn is_raw_rejects_line_buffered_input() {
+            let t = Termios {
+                input_mode: ENABLE_LINE_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT,
+                output_mode: ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+            };
+            assert!(
+                !is_raw(&t),
+                "ENABLE_LINE_INPUT still set must not read as raw"
+            );
+        }
+
+        #[test]
+        fn is_raw_rejects_missing_vt_processing() {
+            let t = Termios {
+                input_mode: ENABLE_VIRTUAL_TERMINAL_INPUT,
+                output_mode: 0,
+            };
+            assert!(
+                !is_raw(&t),
+                "no ENABLE_VIRTUAL_TERMINAL_PROCESSING must not read as raw"
+            );
+        }
+
+        #[test]
+        fn clear_echo_flag_only_clears_echo() {
+            let mut t = Termios {
+                input_mode: ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT,
+                output_mode: 0,
+            };
+            clear_echo_flag(&mut t);
+            assert_eq!(
+                t.input_mode, ENABLE_LINE_INPUT,
+                "line input must survive; only echo clears"
+            );
+        }
     }
 }

@@ -73,16 +73,12 @@
 //! ```
 
 #![warn(missing_docs)]
-// The non-Unix build is a plain buffered read: the editing internals and
-// their `io::Read` import are compiled out, so don't warn that they're dead.
-#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 
 // Terminal syscall backend: the `libc` crate by default, `rusty_libc` under
-// the `rusty-libc` feature.
-#[cfg(unix)]
+// the `rusty-libc` feature, on Unix; `rusty_win32` on Windows.
 mod term_sys;
 
 /// One completion candidate: the text shown in the columned list, and the
@@ -504,17 +500,10 @@ pub enum ReadResult {
 }
 
 /// Terminal size of stdout as `(columns, rows)`, or `None` when stdout is
-/// not a terminal (or on non-Unix builds). What a shell needs to keep
-/// `$COLUMNS`/`$LINES` fresh (bash 5's `checkwinsize` default).
+/// not a terminal. What a shell needs to keep `$COLUMNS`/`$LINES` fresh
+/// (bash 5's `checkwinsize` default).
 pub fn terminal_size() -> Option<(u16, u16)> {
-    #[cfg(unix)]
-    {
-        term_sys::term_size_stdout()
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
+    term_sys::term_size_stdout()
 }
 
 /// Run `f` with terminal echo off (a shell's `read -s`), restoring the
@@ -522,29 +511,22 @@ pub fn terminal_size() -> Option<(u16, u16)> {
 /// internal RAII guard. When stdin is not a terminal there is no echo to
 /// disable and `f` simply runs.
 pub fn with_echo_disabled<T>(f: impl FnOnce() -> T) -> io::Result<T> {
-    #[cfg(unix)]
-    {
-        if !term_sys::isatty_stdin() {
-            return Ok(f());
-        }
-        /// Restores the saved attributes on drop.
-        struct EchoGuard(term_sys::Termios);
-        impl Drop for EchoGuard {
-            fn drop(&mut self) {
-                let _ = term_sys::tcsetattr_stdin_drain(&self.0);
-            }
-        }
-        let saved = term_sys::tcgetattr_stdin()?;
-        let mut silent = saved;
-        term_sys::clear_echo_flag(&mut silent);
-        term_sys::tcsetattr_stdin_drain(&silent)?;
-        let _guard = EchoGuard(saved);
-        Ok(f())
+    if !term_sys::isatty_stdin() {
+        return Ok(f());
     }
-    #[cfg(not(unix))]
-    {
-        Ok(f())
+    /// Restores the saved attributes on drop.
+    struct EchoGuard(term_sys::Termios);
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            let _ = term_sys::tcsetattr_stdin_drain(&self.0);
+        }
     }
+    let saved = term_sys::tcgetattr_stdin()?;
+    let mut silent = saved;
+    term_sys::clear_echo_flag(&mut silent);
+    term_sys::tcsetattr_stdin_drain(&silent)?;
+    let _guard = EchoGuard(saved);
+    Ok(f())
 }
 
 /// The line editor: owns the history and the kill ring, both of which
@@ -592,7 +574,6 @@ pub struct Editor {
 /// *is* a terminal (this path was taken because stdout is piped), the
 /// prompt goes to stderr — bash's rule — so the interactive user still
 /// sees where to type.
-#[cfg(unix)]
 fn read_line_plain(
     prompt: &str,
     hooks: &dyn Hooks,
@@ -1132,45 +1113,16 @@ impl Editor {
         timeout: Option<std::time::Duration>,
         initial: Option<(&str, &str)>,
     ) -> io::Result<ReadResult> {
-        #[cfg(unix)]
-        {
-            let deadline = timeout.map(|t| std::time::Instant::now() + t);
-            // A non-tty stdin (a script piped into an "interactive"
-            // host) can't enter raw mode, and a non-tty stdout (the host
-            // piped into `tee`) has nothing to paint on — repaint escape
-            // sequences would just be sprayed into the pipe. Either way,
-            // fall back to a plain silent read, like readline does.
-            if !term_sys::isatty_stdin() || !term_sys::isatty_stdout() {
-                return read_line_plain(prompt, hooks, deadline);
-            }
-            read_line_raw(self, prompt, rprompt, hooks, deadline, initial)
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        // A non-tty stdin (a script piped into an "interactive"
+        // host) can't enter raw mode, and a non-tty stdout (the host
+        // piped into `tee`) has nothing to paint on — repaint escape
+        // sequences would just be sprayed into the pipe. Either way,
+        // fall back to a plain silent read, like readline does.
+        if !term_sys::isatty_stdin() || !term_sys::isatty_stdout() {
+            return read_line_plain(prompt, hooks, deadline);
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (timeout, initial);
-            // No raw terminal on this platform: a plain buffered read
-            // with no editing — a documented narrowing. Mirrors the Unix
-            // fallback (`read_line_plain`): a non-tty stdin doesn't get the
-            // prompt printed either, so a script piped into an
-            // "interactive" host doesn't get prompt text mixed into its
-            // captured output.
-            let _ = (rprompt, hooks);
-            if std::io::IsTerminal::is_terminal(&io::stdin()) {
-                // The prompt goes to stderr, mirroring the Unix plain
-                // path (bash's rule): stdout may be redirected, and the
-                // prompt is a conversation with the user, not output.
-                write!(io::stderr(), "{prompt}")?;
-                io::stderr().flush()?;
-            }
-            let mut line = String::new();
-            if io::stdin().read_line(&mut line)? == 0 {
-                return Ok(ReadResult::Eof);
-            }
-            while line.ends_with(['\n', '\r']) {
-                line.pop();
-            }
-            Ok(ReadResult::Line(line))
-        }
+        read_line_raw(self, prompt, rprompt, hooks, deadline, initial)
     }
 }
 
@@ -1246,13 +1198,11 @@ enum Key {
 /// Raw-mode RAII guard: restores the saved termios on drop, whatever the
 /// exit path. Keeps both states so `suspend`/`resume` can hand the
 /// terminal to an external `$EDITOR` (C-x C-e) and take it back.
-#[cfg(unix)]
 struct RawMode {
     saved: term_sys::Termios,
     raw: term_sys::Termios,
 }
 
-#[cfg(unix)]
 impl RawMode {
     fn enable() -> io::Result<RawMode> {
         let saved = term_sys::tcgetattr_stdin()?;
@@ -1277,7 +1227,6 @@ impl RawMode {
     }
 }
 
-#[cfg(unix)]
 impl Drop for RawMode {
     fn drop(&mut self) {
         let _ = term_sys::tcsetattr_stdin_drain(&self.saved);
@@ -1287,10 +1236,8 @@ impl Drop for RawMode {
 /// Bracketed-paste RAII guard: terminals wrap a paste in
 /// `ESC[200~ … ESC[201~` while enabled, and the decoder turns that into a
 /// single `Key::Paste` event.
-#[cfg(unix)]
 struct BracketedPaste;
 
-#[cfg(unix)]
 impl BracketedPaste {
     fn enable() -> BracketedPaste {
         // A guard constructor can't propagate a write error; a dead
@@ -1301,7 +1248,6 @@ impl BracketedPaste {
     }
 }
 
-#[cfg(unix)]
 impl Drop for BracketedPaste {
     fn drop(&mut self) {
         let _ = write!(io::stdout(), "\x1b[?2004l");
@@ -1309,7 +1255,6 @@ impl Drop for BracketedPaste {
     }
 }
 
-#[cfg(unix)]
 thread_local! {
     /// Bytes already pulled from fd 0 by one `read_stdin_chunk` call but
     /// not yet handed to the decoder. `read_byte` refills this with a
@@ -1329,7 +1274,6 @@ thread_local! {
 /// [`STDIN_BUF`] count as ready with no syscall; this is what must agree
 /// with `read_byte`'s buffer, or the lone-ESC poll would lie exactly the
 /// way `io::Stdin`'s hidden buffer used to (see `read_byte`).
-#[cfg(unix)]
 fn input_ready(ms: i32) -> bool {
     let buffered = STDIN_BUF.with(|b| {
         let (data, pos) = &*b.borrow();
@@ -1345,7 +1289,6 @@ fn input_ready(ms: i32) -> bool {
 /// arrow keys literally didn't work through the buffered reader). The
 /// difference here is that this buffer *is* what `input_ready` consults,
 /// so the two can never disagree the way `io::Stdin`'s opaque one did.
-#[cfg(unix)]
 fn read_byte(hooks: &dyn Hooks) -> io::Result<Option<u8>> {
     if let Some(b) = STDIN_BUF.with(|b| {
         let (data, pos) = &mut *b.borrow_mut();
@@ -1386,7 +1329,6 @@ fn read_byte(hooks: &dyn Hooks) -> io::Result<Option<u8>> {
 /// `ms` milliseconds — bounds the reads inside multi-byte sequences so a
 /// half-delivered escape sequence or UTF-8 character can't block the
 /// editor (or hold a `read_line_timeout` past its deadline).
-#[cfg(unix)]
 fn read_byte_timeout(hooks: &dyn Hooks, ms: i32) -> io::Result<Option<u8>> {
     if !input_ready(ms) {
         return Ok(None);
@@ -1399,7 +1341,6 @@ fn read_byte_timeout(hooks: &dyn Hooks, ms: i32) -> io::Result<Option<u8>> {
 /// instead of swallowing the following keystrokes as continuations; the
 /// continuation reads are also bounded, so a truncated sequence cannot
 /// block the read.
-#[cfg(unix)]
 fn read_utf8(hooks: &dyn Hooks, first: u8) -> io::Result<char> {
     let need = match first {
         0x00..=0x7f => 0,
@@ -1734,7 +1675,6 @@ fn key_spec(key: &Key) -> String {
 /// A generous inter-byte timeout bounds the collection, so a paste whose
 /// end marker never arrives (a killed sender, a broken terminal) returns
 /// what was received instead of hanging the editor.
-#[cfg(unix)]
 fn read_paste(hooks: &dyn Hooks) -> io::Result<Key> {
     const END: &[u8] = b"\x1b[201~";
     let mut buf: Vec<u8> = Vec::new();
@@ -1750,7 +1690,6 @@ fn read_paste(hooks: &dyn Hooks) -> io::Result<Key> {
     Ok(Key::Paste(String::from_utf8_lossy(&buf).into_owned()))
 }
 
-#[cfg(unix)]
 fn read_key(hooks: &dyn Hooks) -> io::Result<Option<Key>> {
     let Some(b) = read_byte(hooks)? else {
         return Ok(None);
@@ -1837,7 +1776,6 @@ fn read_key(hooks: &dyn Hooks) -> io::Result<Option<Key>> {
 }
 
 /// Terminal width in columns (fallback 80).
-#[cfg(unix)]
 fn term_cols() -> usize {
     term_sys::term_cols_stdout().unwrap_or(80)
 }
@@ -1893,7 +1831,6 @@ fn display_width(s: &str) -> usize {
 /// multi-line bracketed paste), a tab as four spaces. The raw buffer is
 /// what Enter returns; this transform exists only so the render and its
 /// cursor math never emit a raw control byte at the terminal.
-#[cfg(unix)]
 fn visualize(s: &str, start_col: usize) -> String {
     visualize_marked(s, start_col, usize::MAX).0
 }
@@ -1902,7 +1839,6 @@ fn visualize(s: &str, start_col: usize) -> String {
 /// offset `mark` and at the end — so the render measures the whole
 /// buffer, the cursor position, and the paint in a single pass instead
 /// of visualizing the buffer twice and re-measuring the output.
-#[cfg(unix)]
 fn visualize_marked(s: &str, start_col: usize, mark: usize) -> (String, usize, usize) {
     let mut out = String::with_capacity(s.len());
     let mut col = start_col;
@@ -1932,7 +1868,6 @@ fn visualize_marked(s: &str, start_col: usize, mark: usize) -> (String, usize, u
 
 /// One character of [`visualize`]'s transform — everything except tabs,
 /// whose expansion is position-dependent and handled by the callers.
-#[cfg(unix)]
 fn push_vis_char(out: &mut String, c: char) {
     match c {
         '\n' => out.push('⏎'),
@@ -1950,7 +1885,6 @@ fn push_vis_char(out: &mut String, c: char) {
 /// paints the *raw* buffer and the editor re-applies the control-char
 /// transform around the color markup. A non-SGR escape from the hook is
 /// visualized (`^[`) rather than sent to the terminal.
-#[cfg(unix)]
 fn visualize_keep_sgr(s: &str, start_col: usize) -> String {
     let mut out = String::with_capacity(s.len());
     let mut col = start_col;
@@ -2001,7 +1935,6 @@ fn visualize_keep_sgr(s: &str, start_col: usize) -> String {
 /// What the previous key did — drives undo coalescing (runs of plain
 /// inserts undo as one unit), kill-ring appending (consecutive kills grow
 /// one ring entry), yank-pop eligibility, and M-. cycling.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Insert,
@@ -2020,7 +1953,6 @@ enum Action {
 }
 
 /// The per-`read_line` editing state.
-#[cfg(unix)]
 struct LineState<'a> {
     buffer: String,
     cursor: usize, // byte offset into buffer
@@ -2103,7 +2035,6 @@ struct LineState<'a> {
 
 /// Repeated-Tab candidate cycling (zsh `AUTO_MENU`): the word span being
 /// replaced and the candidate list captured when it was printed.
-#[cfg(unix)]
 struct MenuState {
     /// Byte offset the completed word starts at.
     start: usize,
@@ -2114,7 +2045,6 @@ struct MenuState {
     candidates: Vec<Candidate>,
 }
 
-#[cfg(unix)]
 struct SearchState {
     query: String,
     /// Index into history of the current match, if any.
@@ -2130,7 +2060,6 @@ struct SearchState {
 /// `expand_abbreviation`): past-the-cursor or mid-character offsets
 /// would panic the slicing below — a hook bug must not take the host's
 /// read loop down.
-#[cfg(unix)]
 fn clamp_start(s: &str, start: usize, cursor: usize) -> usize {
     let mut start = start.min(cursor);
     while !s.is_char_boundary(start) {
@@ -2149,7 +2078,6 @@ fn resolve_recall(history: &[String], i: usize, expected: &str) -> Option<usize>
     history.iter().rposition(|h| h == expected)
 }
 
-#[cfg(unix)]
 fn read_line_raw(
     ed: &mut Editor,
     prompt: &str,
@@ -2456,7 +2384,6 @@ fn read_line_raw(
 }
 
 /// Cap on consecutive coalesced repaints — see the main loop's bottom.
-#[cfg(unix)]
 const MAX_COALESCED_RUN: u32 = 200;
 
 /// Post-key undo bookkeeping: snapshot any mutation, coalescing runs of
@@ -2464,7 +2391,6 @@ const MAX_COALESCED_RUN: u32 = 200;
 /// of at most 20 characters, readline's chunking: one undo neither wipes
 /// an entire typed line nor replays a long rubout one character at a
 /// time.
-#[cfg(unix)]
 fn record_undo(st: &mut LineState, snapshot: (String, usize)) {
     if st.buffer == snapshot.0 || st.this_action == Action::Undo {
         return;
@@ -2486,7 +2412,6 @@ fn record_undo(st: &mut LineState, snapshot: (String, usize)) {
 
 /// Move to the end of the painted region and start a fresh terminal line,
 /// so whatever runs next begins below the edit region.
-#[cfg(unix)]
 fn finish_line(st: &mut LineState, history: &[String]) -> io::Result<()> {
     // The "move down to the end of the region" math below trusts
     // `painted_rows`/`painted_cursor_row` to describe exactly where the
@@ -2510,7 +2435,6 @@ fn finish_line(st: &mut LineState, history: &[String]) -> io::Result<()> {
 
 /// Whether a key resolves to a completion action — the one case that
 /// must not tear down the menu-cycling state before dispatch.
-#[cfg(unix)]
 fn key_completes(key: &Key, bindings: &[(Key, Binding)], vi_normal: bool) -> bool {
     if vi_normal {
         // vi normal mode's keymap is fixed: Tab completes and Shift-Tab
@@ -2535,7 +2459,6 @@ fn key_completes(key: &Key, bindings: &[(Key, Binding)], vi_normal: bool) -> boo
 /// What the main loop does after a key's action ran: nothing, end the
 /// read (three ways), or hand the line to the external editor (which
 /// needs the loop's `RawMode` handle).
-#[cfg(unix)]
 enum AfterKey {
     Done,
     Accept,
@@ -2549,7 +2472,6 @@ enum AfterKey {
 
 /// Insert pasted text at the cursor, normalizing line endings — shared by
 /// the emacs/vi-insert and vi-normal paste paths.
-#[cfg(unix)]
 fn insert_paste(st: &mut LineState, s: &str) {
     let s = s.replace("\r\n", "\n").replace('\r', "\n");
     st.buffer.insert_str(st.cursor, &s);
@@ -2557,7 +2479,6 @@ fn insert_paste(st: &mut LineState, s: &str) {
 }
 
 /// Enter C-r / C-s incremental search.
-#[cfg(unix)]
 fn start_search(st: &mut LineState, history: &[String], forward: bool) {
     st.search = Some(SearchState {
         query: String::new(),
@@ -2575,7 +2496,6 @@ fn start_search(st: &mut LineState, history: &[String], forward: bool) {
 }
 
 /// C-l: clear the screen; the next render repaints at the top.
-#[cfg(unix)]
 fn clear_screen(st: &mut LineState) -> io::Result<()> {
     write!(io::stdout(), "\x1b[2J\x1b[H")?;
     st.painted_rows = 1;
@@ -2588,7 +2508,6 @@ fn clear_screen(st: &mut LineState) -> io::Result<()> {
 /// giving the host its idle beat — for the helpers that read their own
 /// follow-up key (C-x chords, quoted insert). `false` means the deadline
 /// passed; the caller gives up and the main loop returns `TimedOut`.
-#[cfg(unix)]
 fn wait_for_key(st: &LineState) -> io::Result<bool> {
     loop {
         if let Some(d) = st.deadline
@@ -2605,7 +2524,6 @@ fn wait_for_key(st: &LineState) -> io::Result<bool> {
 
 /// The readline C-x chords supported: C-x C-e (edit the line in
 /// $EDITOR) and C-x C-u (undo).
-#[cfg(unix)]
 fn ctrl_x_chord(st: &mut LineState) -> io::Result<AfterKey> {
     if !wait_for_key(st)? {
         return Ok(AfterKey::Done); // deadline: the main loop times out
@@ -2621,7 +2539,6 @@ fn ctrl_x_chord(st: &mut LineState) -> io::Result<AfterKey> {
 }
 
 /// Ring the terminal bell per the configured style.
-#[cfg(unix)]
 fn bell(style: BellStyle) -> io::Result<()> {
     match style {
         BellStyle::None => return Ok(()),
@@ -2644,7 +2561,6 @@ fn bell(style: BellStyle) -> io::Result<()> {
 /// A `bind_host` key: suspend raw mode, hand the line and cursor to the
 /// host (bash's `bind -x`, `READLINE_LINE`/`READLINE_POINT`), take back
 /// whatever it wrote, and repaint on a fresh region.
-#[cfg(unix)]
 fn run_host_binding(
     st: &mut LineState,
     raw: &RawMode,
@@ -2670,7 +2586,6 @@ fn run_host_binding(
 
 /// Execute one named action — the emacs (and vi-insert) command set.
 /// `key` supplies the character for `SelfInsert`.
-#[cfg(unix)]
 fn run_action(
     st: &mut LineState,
     action: EditorAction,
@@ -2879,7 +2794,6 @@ fn run_action(
 /// the `iw`/`aw` text objects, edits `x X D C s S Y r ~ p P u`, inserts
 /// `i I a A`, history `k j G`. See the README for what's deliberately
 /// not modeled (registers, `.` repeat, `/` search).
-#[cfg(unix)]
 fn handle_vi_normal(st: &mut LineState, key: Key, history: &[String], ring: &mut VecDeque<String>) {
     // A pending `r`: the next character replaces the `count` characters
     // under the cursor (`3rx` → `xxx`); like vim, it fails outright when
@@ -3163,7 +3077,6 @@ fn handle_vi_normal(st: &mut LineState, key: Key, history: &[String], ring: &mut
 }
 
 /// Apply a vi operator over the span from the cursor to `target`.
-#[cfg(unix)]
 fn vi_apply_op(
     st: &mut LineState,
     ring: &mut VecDeque<String>,
@@ -3207,7 +3120,6 @@ fn vi_apply_op(
     }
 }
 
-#[cfg(unix)]
 fn invert_find(kind: char) -> char {
     match kind {
         'f' => 'F',
@@ -3218,7 +3130,6 @@ fn invert_find(kind: char) -> char {
 }
 
 /// Resolve `f F t T` to a target position (and operator inclusivity).
-#[cfg(unix)]
 fn vi_find_target(s: &str, pos: usize, kind: char, target: char) -> Option<(usize, bool)> {
     match kind {
         'f' | 't' => {
@@ -3250,7 +3161,6 @@ fn vi_find_target(s: &str, pos: usize, kind: char, target: char) -> Option<(usiz
     }
 }
 
-#[cfg(unix)]
 enum SearchOutcome {
     Continue,
     Accept,
@@ -3262,7 +3172,6 @@ enum SearchOutcome {
 
 /// Ctrl-R/Ctrl-S incremental search (bash's `(reverse-i-search)`); C-r
 /// steps to older matches, C-s to newer ones.
-#[cfg(unix)]
 fn handle_search_key(
     st: &mut LineState,
     key: Key,
@@ -3419,7 +3328,6 @@ fn starts_with_match(hay: &str, prefix: &str, ignore_case: bool) -> bool {
 }
 
 /// Most recent history entry (strictly before `below`) containing `query`.
-#[cfg(unix)]
 fn find_match(history: &[String], query: &str, below: usize, ignore_case: bool) -> Option<usize> {
     if query.is_empty() {
         return None;
@@ -3430,7 +3338,6 @@ fn find_match(history: &[String], query: &str, below: usize, ignore_case: bool) 
 }
 
 /// Earliest history entry at or after `from` containing `query`.
-#[cfg(unix)]
 fn find_match_fwd(
     history: &[String],
     query: &str,
@@ -3446,23 +3353,19 @@ fn find_match_fwd(
         .map(|p| p + from)
 }
 
-#[cfg(unix)]
 fn insert_char(st: &mut LineState, c: char) {
     st.buffer.insert(st.cursor, c);
     st.cursor += c.len_utf8();
 }
 
-#[cfg(unix)]
 fn prev_char_start(s: &str, pos: usize) -> Option<usize> {
     s[..pos].char_indices().next_back().map(|(i, _)| i)
 }
 
-#[cfg(unix)]
 fn next_char_end(s: &str, pos: usize) -> Option<usize> {
     s[pos..].chars().next().map(|c| pos + c.len_utf8())
 }
 
-#[cfg(unix)]
 fn fwd_n(s: &str, pos: usize, n: usize) -> usize {
     let mut p = pos;
     for _ in 0..n {
@@ -3474,7 +3377,6 @@ fn fwd_n(s: &str, pos: usize, n: usize) -> usize {
     p
 }
 
-#[cfg(unix)]
 fn back_n(s: &str, pos: usize, n: usize) -> usize {
     let mut p = pos;
     for _ in 0..n {
@@ -3486,7 +3388,6 @@ fn back_n(s: &str, pos: usize, n: usize) -> usize {
     p
 }
 
-#[cfg(unix)]
 fn apply_n(s: &str, pos: usize, n: usize, f: fn(&str, usize) -> usize) -> usize {
     let mut p = pos;
     for _ in 0..n {
@@ -3495,7 +3396,6 @@ fn apply_n(s: &str, pos: usize, n: usize, f: fn(&str, usize) -> usize) -> usize 
     p
 }
 
-#[cfg(unix)]
 fn first_nonblank(s: &str) -> usize {
     s.char_indices()
         .find(|&(_, c)| !c.is_whitespace())
@@ -3736,7 +3636,6 @@ fn vi_word_object(s: &str, pos: usize, around: bool) -> Option<(usize, usize)> {
 /// Delete `start..end` into the kill ring. Consecutive kills grow one
 /// ring entry (appending for forward kills, prepending for backward) —
 /// readline's rule, so C-w C-w C-y restores both words.
-#[cfg(unix)]
 fn kill_span(
     st: &mut LineState,
     ring: &mut VecDeque<String>,
@@ -3767,7 +3666,6 @@ fn kill_span(
     };
 }
 
-#[cfg(unix)]
 fn push_ring(ring: &mut VecDeque<String>, text: String, max: usize) {
     if max == 0 {
         return;
@@ -3779,7 +3677,6 @@ fn push_ring(ring: &mut VecDeque<String>, text: String, max: usize) {
 }
 
 /// C-y: insert the top of the kill ring at the cursor.
-#[cfg(unix)]
 fn yank(st: &mut LineState, ring: &VecDeque<String>) {
     let Some(text) = ring.back() else { return };
     let start = st.cursor;
@@ -3791,7 +3688,6 @@ fn yank(st: &mut LineState, ring: &VecDeque<String>) {
 
 /// M-y immediately after a yank: rotate the yanked text to the previous
 /// ring entry.
-#[cfg(unix)]
 fn yank_pop(st: &mut LineState, ring: &VecDeque<String>) {
     if st.prev_action != Action::Yank || ring.is_empty() {
         return;
@@ -3808,7 +3704,6 @@ fn yank_pop(st: &mut LineState, ring: &VecDeque<String>) {
 }
 
 /// C-_ / C-x C-u / vi `u`: pop the undo stack.
-#[cfg(unix)]
 fn undo_cmd(st: &mut LineState) {
     if let Some((buf, cur)) = st.undo.pop_back() {
         st.cursor = cur.min(buf.len());
@@ -3819,7 +3714,6 @@ fn undo_cmd(st: &mut LineState) {
 
 /// C-t: transpose the characters around the cursor (at end of line, the
 /// two before it — readline's rule).
-#[cfg(unix)]
 fn transpose(st: &mut LineState) {
     if st.cursor == st.buffer.len()
         && let Some(prev) = prev_char_start(&st.buffer, st.cursor)
@@ -3838,7 +3732,6 @@ fn transpose(st: &mut LineState) {
 
 /// M-t: transpose the word at/after the cursor with the one before it,
 /// leaving the cursor after the moved pair.
-#[cfg(unix)]
 fn transpose_words(st: &mut LineState) {
     // Start of the maximal run of `pred` characters ending at `from`.
     fn run_start(s: &str, from: usize, pred: impl Fn(char) -> bool) -> usize {
@@ -3865,7 +3758,6 @@ fn transpose_words(st: &mut LineState) {
     st.cursor = s1 + w2.len() + sep.len() + w1.len();
 }
 
-#[cfg(unix)]
 enum CaseOp {
     Upper,
     Lower,
@@ -3874,7 +3766,6 @@ enum CaseOp {
 
 /// M-u / M-l / M-c: upcase / downcase / capitalize from the cursor to the
 /// end of the word, moving the cursor past it.
-#[cfg(unix)]
 fn case_word(st: &mut LineState, op: CaseOp) {
     let end = word_forward_alnum(&st.buffer, st.cursor);
     if end <= st.cursor {
@@ -3906,7 +3797,6 @@ fn case_word(st: &mut LineState, op: CaseOp) {
 /// M-. / M-_: insert the last word of the previous history entry;
 /// repeated presses cycle back through older entries, replacing the
 /// previous insertion.
-#[cfg(unix)]
 fn insert_last_arg(st: &mut LineState, history: &[String]) {
     if history.is_empty() {
         return;
@@ -3939,7 +3829,6 @@ fn insert_last_arg(st: &mut LineState, history: &[String]) {
 /// C-] (readline `character-search`): read one character and move the
 /// cursor to its next occurrence — backward for
 /// `character-search-backward`. Reuses the vi `f`/`F` find machinery.
-#[cfg(unix)]
 fn character_search(st: &mut LineState, backward: bool) -> io::Result<()> {
     if !wait_for_key(st)? {
         return Ok(()); // deadline: the main loop times out
@@ -3957,7 +3846,6 @@ fn character_search(st: &mut LineState, backward: bool) -> io::Result<()> {
 
 /// C-v / C-q: insert the next key literally (a tab, an ESC, a ^C…);
 /// the render shows it `^X`-style.
-#[cfg(unix)]
 fn quoted_insert(st: &mut LineState) -> io::Result<()> {
     if !wait_for_key(st)? {
         return Ok(()); // deadline: the main loop times out
@@ -3979,11 +3867,11 @@ fn quoted_insert(st: &mut LineState) -> io::Result<()> {
 /// in a temp file; on a clean exit the edited text is returned and — like
 /// bash — executed immediately.
 /// Create the C-x C-e scratch file: an unpredictable name claimed with
-/// `O_EXCL` and `0600` permissions, so a shared `$TMPDIR` gives no
-/// symlink-attack window and other users can't read the command line.
-#[cfg(unix)]
+/// exclusive creation (`O_EXCL`/`CREATE_NEW`, `0600` permissions on Unix —
+/// Windows has no mode-bit equivalent, but the exclusive-create check
+/// still holds), so a shared `$TMPDIR` gives no symlink-attack window and
+/// other users can't read the command line where mode bits apply.
 fn create_edit_tempfile(contents: &str) -> io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::OpenOptionsExt;
     let dir = std::env::temp_dir();
     let mut nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3992,17 +3880,16 @@ fn create_edit_tempfile(contents: &str) -> io::Result<std::path::PathBuf> {
         ^ (std::process::id() as u64) << 32;
     for _ in 0..64 {
         // xorshift over the time/pid seed: unpredictable enough for a
-        // name that O_EXCL then checks authoritatively.
+        // name that the exclusive-create check then authoritatively backs.
         nonce ^= nonce << 13;
         nonce ^= nonce >> 7;
         nonce ^= nonce << 17;
         let path = dir.join(format!("rusty-lines-edit-{nonce:016x}.txt"));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        match opts.open(&path) {
             Ok(mut f) => {
                 f.write_all(contents.as_bytes())?;
                 return Ok(path);
@@ -4017,7 +3904,6 @@ fn create_edit_tempfile(contents: &str) -> io::Result<std::path::PathBuf> {
     ))
 }
 
-#[cfg(unix)]
 fn edit_in_editor(
     st: &mut LineState,
     raw: &RawMode,
@@ -4058,7 +3944,6 @@ fn edit_in_editor(
 /// Stash the buffer as an in-session edit of the current history entry
 /// (or clear a stale stash when the edit was reverted) before navigating
 /// away — so coming back shows the user's version, not the original.
-#[cfg(unix)]
 fn stash_hist_edit(st: &mut LineState, history: &[String]) {
     if let Some(i) = st.hist_index {
         if history.get(i) == Some(&st.buffer) {
@@ -4071,7 +3956,6 @@ fn stash_hist_edit(st: &mut LineState, history: &[String]) {
 
 /// The text to show for history entry `i`: the in-session edit if one
 /// exists, else the original.
-#[cfg(unix)]
 fn hist_entry(st: &LineState, history: &[String], i: usize) -> String {
     st.hist_edits
         .get(&i)
@@ -4079,7 +3963,6 @@ fn hist_entry(st: &LineState, history: &[String], i: usize) -> String {
         .unwrap_or_else(|| history[i].clone())
 }
 
-#[cfg(unix)]
 fn history_prev(st: &mut LineState, history: &[String]) {
     stash_hist_edit(st, history);
     let next_index = match st.hist_index {
@@ -4102,7 +3985,6 @@ fn history_prev(st: &mut LineState, history: &[String]) {
     st.cursor = st.buffer.len();
 }
 
-#[cfg(unix)]
 fn history_next(st: &mut LineState, history: &[String]) {
     stash_hist_edit(st, history);
     match st.hist_index {
@@ -4123,7 +4005,6 @@ fn history_next(st: &mut LineState, history: &[String]) {
 }
 
 /// M-<: jump to the oldest history entry.
-#[cfg(unix)]
 fn history_first(st: &mut LineState, history: &[String]) {
     if history.is_empty() {
         return;
@@ -4138,7 +4019,6 @@ fn history_first(st: &mut LineState, history: &[String]) {
 }
 
 /// M->: back to the live (draft) line.
-#[cfg(unix)]
 fn history_last(st: &mut LineState, history: &[String]) {
     stash_hist_edit(st, history);
     if st.hist_index.is_some() {
@@ -4150,7 +4030,6 @@ fn history_last(st: &mut LineState, history: &[String]) {
 
 /// PageUp / M-p: previous history entry starting with the text before the
 /// cursor (zsh's `history-beginning-search-backward`, fish's Up).
-#[cfg(unix)]
 fn history_prefix_prev(st: &mut LineState, history: &[String]) {
     // Re-anchor on the buffer up to the cursor whenever the previous key
     // wasn't itself a prefix search (zsh's rule) — anchoring only when
@@ -4178,7 +4057,6 @@ fn history_prefix_prev(st: &mut LineState, history: &[String]) {
 }
 
 /// PageDown / M-n: next prefix match, or back to the draft.
-#[cfg(unix)]
 fn history_prefix_next(st: &mut LineState, history: &[String]) {
     st.this_action = Action::PrefixSearch;
     stash_hist_edit(st, history);
@@ -4203,7 +4081,6 @@ fn history_prefix_next(st: &mut LineState, history: &[String]) {
 /// common prefix; when that makes no progress, print the columned
 /// candidate list below the line and arm menu cycling, so further Tabs
 /// walk the candidates in-line (zsh `AUTO_MENU`).
-#[cfg(unix)]
 fn complete_at_cursor(st: &mut LineState, history: &[String]) -> io::Result<()> {
     let (start, mut candidates) = st.hooks.complete(&st.buffer, st.cursor);
     let start = clamp_start(&st.buffer, start, st.cursor);
@@ -4255,7 +4132,6 @@ fn complete_at_cursor(st: &mut LineState, history: &[String]) -> io::Result<()> 
 /// Leave the edit region and print the candidate list (behind the
 /// `completion-query-items` question when it's big). `false` when the
 /// user declined or the deadline passed — nothing was listed.
-#[cfg(unix)]
 fn list_candidates(
     st: &mut LineState,
     candidates: &[Candidate],
@@ -4293,7 +4169,6 @@ fn list_candidates(
 
 /// Print the candidate list in vertical (column-major) order, the way
 /// readline lays out its completion listing.
-#[cfg(unix)]
 fn print_candidate_columns(candidates: &[Candidate]) -> io::Result<()> {
     let width = candidates
         .iter()
@@ -4320,7 +4195,6 @@ fn print_candidate_columns(candidates: &[Candidate]) -> io::Result<()> {
 /// readline `menu-complete` (also Tab under `set_menu_complete`): insert
 /// the first candidate immediately and arm cycling — no LCP step, no
 /// candidate list.
-#[cfg(unix)]
 fn menu_complete_start(st: &mut LineState) -> io::Result<()> {
     if menu_arm(st)? {
         menu_next(st);
@@ -4330,7 +4204,6 @@ fn menu_complete_start(st: &mut LineState) -> io::Result<()> {
 
 /// Ask the host for candidates and arm the cycling state without
 /// stepping. `false` (after ringing the bell) when there are none.
-#[cfg(unix)]
 fn menu_arm(st: &mut LineState) -> io::Result<bool> {
     let (start, mut candidates) = st.hooks.complete(&st.buffer, st.cursor);
     let start = clamp_start(&st.buffer, start, st.cursor);
@@ -4350,14 +4223,12 @@ fn menu_arm(st: &mut LineState) -> io::Result<bool> {
 
 /// A further Tab with the menu armed: replace the word with the next
 /// candidate, wrapping around the list.
-#[cfg(unix)]
 fn menu_next(st: &mut LineState) {
     menu_step(st, false)
 }
 
 /// One step of the cycle, wrapping in either direction; a cold backward
 /// step starts on the last candidate.
-#[cfg(unix)]
 fn menu_step(st: &mut LineState, backward: bool) {
     let Some(mut menu) = st.menu.take() else {
         return;
@@ -4426,7 +4297,6 @@ fn common_prefix(names: &[&str], ignore_case: bool) -> String {
 /// render and the accept paths (Right/End/M-f) all consult it, and a
 /// hint hook doing history scans or filesystem checks is the expensive
 /// kind (fish caches its autosuggestion the same way).
-#[cfg(unix)]
 fn cached_hint(st: &mut LineState, history: &[String]) -> Option<String> {
     if let Some((buf, hint)) = &st.hint_cache
         && *buf == st.buffer
@@ -4446,7 +4316,6 @@ fn cached_hint(st: &mut LineState, history: &[String]) -> Option<String> {
 /// force the wrap immediately — sidestepping terminals' delayed-wrap
 /// state, which would otherwise break the relative cursor movements the
 /// next repaint starts with.
-#[cfg(unix)]
 fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
     let cols = term_cols().max(2);
     let mut out = String::new();
@@ -4583,12 +4452,10 @@ fn render(st: &mut LineState, history: &[String]) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     fn state(buf: &str, cursor: usize) -> LineState<'static> {
         state_hooked(buf, cursor, &NoHooks)
     }
 
-    #[cfg(unix)]
     fn state_hooked<'a>(buf: &str, cursor: usize, hooks: &'a dyn Hooks) -> LineState<'a> {
         LineState {
             buffer: buf.to_string(),
@@ -4673,7 +4540,6 @@ mod tests {
         assert_eq!(vi_word_end(s, 1), 4); // b → d of "cd"
     }
 
-    #[cfg(unix)]
     #[test]
     fn vi_find_targets() {
         //       0123456
@@ -4687,7 +4553,6 @@ mod tests {
 
     #[test]
     fn visualize_control_chars() {
-        #[cfg(unix)]
         {
             assert_eq!(visualize("plain", 0), "plain");
             assert_eq!(visualize("a\x1bb", 0), "a^[b");
@@ -4702,7 +4567,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn csi_sequences() {
         assert_eq!(csi_key("", b'A'), Key::Up);
@@ -4733,7 +4597,6 @@ mod tests {
         assert_eq!(ed.history(), &["echo a; echo b"]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn kill_ring_appends_consecutive_kills() {
         let mut ring = VecDeque::new();
@@ -4752,7 +4615,6 @@ mod tests {
         assert_eq!(st.buffer, "one two three");
     }
 
-    #[cfg(unix)]
     #[test]
     fn yank_pop_rotates_ring() {
         let mut ring = VecDeque::from(vec!["old".to_string(), "new".to_string()]);
@@ -4768,7 +4630,6 @@ mod tests {
         let _ = &mut ring;
     }
 
-    #[cfg(unix)]
     #[test]
     fn transpose_words_swaps_around_cursor() {
         let mut st = state("echo one two", 12);
@@ -4781,7 +4642,6 @@ mod tests {
         assert_eq!(st.buffer, "word");
     }
 
-    #[cfg(unix)]
     #[test]
     fn case_ops() {
         let mut st = state("echo word here", 5);
@@ -4796,7 +4656,6 @@ mod tests {
         assert_eq!(st.buffer, "echo Word");
     }
 
-    #[cfg(unix)]
     #[test]
     fn last_arg_inserts_and_cycles() {
         let history = vec!["echo first one".to_string(), "echo second two".to_string()];
@@ -4808,7 +4667,6 @@ mod tests {
         assert_eq!(st.buffer, "echo one");
     }
 
-    #[cfg(unix)]
     #[test]
     fn undo_restores_snapshots() {
         let mut st = state("hello", 5);
@@ -4823,7 +4681,6 @@ mod tests {
         assert_eq!(st.buffer, "hell");
     }
 
-    #[cfg(unix)]
     #[test]
     fn prefix_search_matches_start_only() {
         let history = vec![
@@ -4848,7 +4705,6 @@ mod tests {
         assert_eq!(st.buffer, "git"); // back to the draft
     }
 
-    #[cfg(unix)]
     #[test]
     fn prefix_search_reanchors_after_other_keys() {
         let history = vec!["echo x".to_string(), "git status".to_string()];
@@ -4969,7 +4825,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
-    #[cfg(unix)]
     #[test]
     fn rebound_key_runs_the_new_action() {
         // C-f rebound to kill-line: dispatch consults the custom table.
@@ -4987,7 +4842,6 @@ mod tests {
         assert_eq!(ring, ["llo"]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn menu_complete_inserts_first_candidate_immediately() {
         struct H;
@@ -5099,7 +4953,6 @@ mod tests {
         assert_eq!(ed.history(), ["a", "b", "a"]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn revert_line_undoes_everything_at_once() {
         let mut st = state("hello", 5);
@@ -5120,7 +4973,6 @@ mod tests {
         assert!(st.undo.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn menu_cycling_walks_candidates_and_wraps() {
         let cand = |s: &str| Candidate {
@@ -5185,7 +5037,6 @@ mod tests {
         assert_eq!(vi_word_object("", 0, true), None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn vi_diw_and_caw_apply_operator_over_word_object() {
         let history: Vec<String> = Vec::new();
@@ -5215,7 +5066,6 @@ mod tests {
         assert!(!st.vi_normal);
     }
 
-    #[cfg(unix)]
     #[test]
     fn vi_percent_jumps_and_deletes_inclusively() {
         let history: Vec<String> = Vec::new();
@@ -5231,7 +5081,6 @@ mod tests {
         assert_eq!(st.buffer, "f g");
     }
 
-    #[cfg(unix)]
     #[test]
     fn vi_g_fetches_history_by_count() {
         let history = vec![
@@ -5252,7 +5101,6 @@ mod tests {
         assert_eq!(st.draft, "draft");
     }
 
-    #[cfg(unix)]
     #[test]
     fn delete_horizontal_space_removes_blanks_around_cursor() {
         let mut ring = VecDeque::new();
@@ -5281,7 +5129,6 @@ mod tests {
         assert_eq!(st.buffer, "word");
     }
 
-    #[cfg(unix)]
     #[test]
     fn kill_whole_line_kills_regardless_of_cursor() {
         let mut ring = VecDeque::new();
@@ -5298,7 +5145,6 @@ mod tests {
         assert_eq!(ring.back().map(String::as_str), Some("entire line"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn operate_and_get_next_accepts_with_recall() {
         let mut ring = VecDeque::new();
@@ -5328,7 +5174,6 @@ mod tests {
         assert_eq!(ed.history(), [" secret"]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn kill_ring_cap_rotates_oldest_out() {
         let mut ring = VecDeque::new();
@@ -5342,7 +5187,6 @@ mod tests {
         assert!(ed.kill_ring.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn incremental_search_flags_a_failing_query() {
         let history = vec!["alpha".to_string(), "beta".to_string()];
@@ -5362,7 +5206,6 @@ mod tests {
         assert!(!st.search.as_ref().unwrap().failed);
     }
 
-    #[cfg(unix)]
     #[test]
     fn hint_is_computed_once_per_buffer() {
         use std::cell::Cell;
@@ -5383,7 +5226,6 @@ mod tests {
         assert_eq!(hooks.0.get(), 2);
     }
 
-    #[cfg(unix)]
     #[test]
     fn paste_inserts_in_vi_normal_mode() {
         let history: Vec<String> = Vec::new();
@@ -5399,7 +5241,6 @@ mod tests {
         handle_vi_normal(&mut st, Key::Char('u'), &history, &mut ring);
     }
 
-    #[cfg(unix)]
     #[test]
     fn back_tab_decodes_and_cycles_backward() {
         assert_eq!(csi_key("", b'Z'), Key::BackTab);
@@ -5438,7 +5279,6 @@ mod tests {
         assert_eq!(display_width("\x1b[38;5;196mred\x1b[0m"), 3);
     }
 
-    #[cfg(unix)]
     #[test]
     fn visualize_keep_sgr_passes_color_and_transforms_the_rest() {
         // SGR passes through; tabs/newlines/control chars still render.
@@ -5459,7 +5299,6 @@ mod tests {
         assert!(!contains_match("Echo Foo", "foo", false));
         assert!(starts_with_match("Echo Foo", "echo", true));
         assert!(!starts_with_match("Echo Foo", "echo", false));
-        #[cfg(unix)]
         {
             let history = vec!["Git Status".to_string()];
             assert_eq!(find_match(&history, "git", history.len(), true), Some(0));
@@ -5467,7 +5306,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn vi_count_replace_and_paste() {
         let history: Vec<String> = Vec::new();
@@ -5526,7 +5364,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[cfg(unix)]
     #[test]
     fn search_exit_places_cursor_on_the_match() {
         assert_eq!(match_pos("echo --foo bar", "--foo", false), Some(5));
@@ -5546,7 +5383,6 @@ mod tests {
         assert_eq!(st.cursor, 5);
     }
 
-    #[cfg(unix)]
     #[test]
     fn undo_insert_groups_cap_at_20() {
         let mut st = state("", 0);
@@ -5565,7 +5401,6 @@ mod tests {
         assert_eq!(st.buffer.len(), 40, "one undo removes one 20-char group");
     }
 
-    #[cfg(unix)]
     #[test]
     fn vi_delete_key_kills_into_the_ring() {
         let history: Vec<String> = Vec::new();
@@ -5587,7 +5422,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn unique_completion_appends_the_append_character() {
         struct H;
@@ -5614,7 +5448,6 @@ mod tests {
         assert_eq!(st.buffer, "alpha");
     }
 
-    #[cfg(unix)]
     #[test]
     fn insert_completions_inserts_all_matches() {
         struct H;
@@ -5655,7 +5488,6 @@ mod tests {
         assert_eq!(resolve_recall(&h, 1, "b"), None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn paste_during_search_types_into_the_query() {
         let history = vec!["echo --verbose".to_string()];
@@ -5670,7 +5502,6 @@ mod tests {
         assert_eq!(s.hit, Some(0));
     }
 
-    #[cfg(unix)]
     #[test]
     fn search_starts_from_the_current_history_position() {
         let history = vec!["git alpha".to_string(), "git beta".to_string()];
@@ -5691,7 +5522,6 @@ mod tests {
         assert_eq!(st.search.as_ref().unwrap().hit, None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn malformed_hook_offsets_are_clamped_not_panics() {
         struct Evil;
@@ -5765,7 +5595,6 @@ mod tests {
         assert!(ed.bindings().all(|(k, _)| k != "\\C-g"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn back_tab_completes_in_vi_normal_mode_too() {
         assert!(key_completes(&Key::BackTab, &[], true));
@@ -5807,7 +5636,6 @@ mod tests {
             let _ = contains_match(&s, "aB", true);
             let _ = starts_with_match(&s, &s, true);
             let _ = match_pos(&s, "aB", round % 2 == 0);
-            #[cfg(unix)]
             {
                 let col = (xorshift(&mut seed) % 40) as usize;
                 let _ = visualize(&s, col);
@@ -5824,7 +5652,6 @@ mod tests {
                 let _ = vi_match_bracket(&s, i);
                 let _ = vi_word_object(&s, i, true);
                 let _ = vi_word_object(&s, i, false);
-                #[cfg(unix)]
                 {
                     let _ = vi_find_target(&s, i, 'f', 'x');
                     let _ = vi_find_target(&s, i, 'T', 'x');
@@ -5886,7 +5713,6 @@ mod tests {
         assert!(format!("{:?}", Editor::new()).contains("history"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn double_esc_decodes_as_escape() {
         // The streaming decoder's pure twin can't express the timing
@@ -5899,7 +5725,6 @@ mod tests {
         assert!(term_sys::is_raw(&t));
     }
 
-    #[cfg(unix)]
     #[test]
     fn undo_coalesces_delete_runs_like_insert_runs() {
         // Type 5 chars, then rub them all out one Backspace at a time:
@@ -5934,7 +5759,6 @@ mod tests {
         assert_eq!(st.buffer, "aaaaa", "one undo restores the whole rubout");
     }
 
-    #[cfg(unix)]
     #[test]
     fn search_backspace_stays_position_disciplined() {
         let history = vec!["git alpha".to_string(), "git beta".to_string()];
@@ -6023,7 +5847,6 @@ mod tests {
         assert_send::<NoHooks>();
     }
 
-    #[cfg(unix)]
     #[test]
     fn history_edits_stash_and_restore() {
         let history = vec!["one".to_string(), "two".to_string()];
@@ -6048,7 +5871,6 @@ mod tests {
         assert_eq!(st.buffer, "draft");
     }
 
-    #[cfg(unix)]
     #[test]
     fn search_moves_the_history_position_and_interrupts() {
         let history = vec!["alpha".to_string(), "beta".to_string()];
@@ -6082,7 +5904,6 @@ mod tests {
         assert_eq!(default_action(&Key::Ctrl('g')), Some(EditorAction::Abort));
     }
 
-    #[cfg(unix)]
     #[test]
     fn alt_f_accepts_one_hint_word() {
         struct H;
