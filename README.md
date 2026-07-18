@@ -150,10 +150,23 @@ either niche, terminal-hostile, or a different program's job:
   sequences). Width is per-`char` via `unicode-width`; getting clusters
   right would add a segmentation dependency while terminals themselves
   disagree on cluster widths, so the common-case behavior is kept.
-- **Non-tty / non-Unix**: a piped stdin *or* stdout gets a plain line
-  read (there is nothing to repaint on a pipe); when stdin is still a
-  terminal, the prompt goes to stderr, bash's rule, so the user sees
-  where to type. Non-Unix builds get a buffered prompt-and-read.
+- **Non-tty**: a piped stdin *or* stdout gets a plain line read (there
+  is nothing to repaint on a pipe); when stdin is still a terminal, the
+  prompt goes to stderr, bash's rule, so the user sees where to type.
+  Applies equally on Windows and Unix — raw-mode editing itself is not
+  a narrowing on either platform (see "Platforms" below).
+
+## Platforms
+
+Full raw-mode editing — key decoding, the render engine, keymaps,
+history, everything above — runs on both Unix and Windows 10+ (1809 or
+later, for `ENABLE_VIRTUAL_TERMINAL_INPUT` support). The terminal
+surface is backed by `rusty_libc`/`libc` (`termios`/`poll`/`read`/
+`TIOCGWINSZ`) on Unix and by
+[`rusty_win32`](https://github.com/baileyrd/rusty_win32)
+(`GetConsoleMode`/`SetConsoleMode`/`ReadFile`/`WaitForSingleObject`/
+`GetConsoleScreenBufferInfo`) on Windows — see `src/term_sys.rs` for the
+shared interface both backends implement.
 
 ## Verification
 
@@ -163,7 +176,14 @@ last-arg cycling, prefix search, control-char visualization, CSI decode)
 are unit-tested in `src/lib.rs`. End-to-end behavior — raw-mode escape
 sequences, repaint math, bracketed paste, the full keymaps under a real
 pseudo-terminal — is exercised downstream by rush's pty harness
-(`tests/pty/editor_pty_test.py` in the rush repo, 28 scenarios).
+(`tests/pty/editor_pty_test.py` in the rush repo, 28 scenarios), and by
+this crate's own `tests/pty.rs` (30 scenarios) — both Unix-only; there
+is no equivalent pseudo-terminal-driven behavioral suite for the
+Windows backend, only compilation and the pure bit-math unit tests in
+`term_sys.rs`'s Windows backend (`apply_raw_flags`/`is_raw`/
+`clear_echo_flag`) plus whatever `rusty_win32`'s own tests already cover
+at the primitive layer. Real interactive verification on Windows is
+still outstanding.
 
 ## License
 

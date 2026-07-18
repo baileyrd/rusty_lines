@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Windows raw-mode editing: `term_sys.rs` grows a `rusty_win32`-backed
+  Windows implementation of its termios-shaped interface
+  (`GetConsoleMode`/`SetConsoleMode`/`ReadFile`/`WaitForSingleObject`/
+  `GetConsoleScreenBufferInfo` — not ConPTY, which hosts a *child*
+  process's console rather than this process's own), and the raw
+  editor internals (key decoding, render engine, keymaps, history,
+  bracketed paste, `C-x C-e` edit-in-`$EDITOR`) — previously
+  `#[cfg(unix)]`-only, falling back to a plain buffered read on
+  Windows — now run on both platforms. No behavioral regression on
+  Unix: the full existing test suite (`cargo test`, including the
+  30-scenario `tests/pty.rs` pseudo-terminal suite) passes unchanged.
+  The Windows path has no equivalent pseudo-terminal-driven test
+  coverage yet (`tests/pty.rs` stays `#![cfg(unix)]`-only) — only
+  compilation and `term_sys.rs`'s own pure bit-math unit tests are
+  verified in CI; real interactive verification on Windows is still
+  outstanding.
+
 ## 0.4.0 — 2026-07-17
 
 - Ninth review pass: self-review of the previous performance pass, plus

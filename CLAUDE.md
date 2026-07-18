@@ -58,11 +58,25 @@ Layers inside `read_line`, bottom to top:
 - **History**: multi-line entries are stored joined with `; ` (bash
   `cmdhist`); `load_history` tolerates a rustyline `#V2` header.
 
-Platform split: the raw editor is `cfg(unix)`. Non-tty stdin falls back to a
-plain read; non-Unix builds get a buffered prompt-and-read. The crate root has
-`#![cfg_attr(not(unix), allow(dead_code, unused_imports))]` because the
-editing internals are compiled out there — the Windows CI job exists to keep
-that fallback compiling.
+Platform split: the raw editor runs on both Unix and Windows — the only
+platform-specific code is `term_sys.rs`, which exposes one interface
+(`isatty_*`/`tcgetattr_stdin`/`tcsetattr_stdin_drain`/`apply_raw_flags`/
+`is_raw`/`poll_stdin`/`read_stdin_chunk`/`term_*_stdout`/`clear_echo_flag`)
+backed by `libc`/`rusty_libc` (Unix) or `rusty_win32` (Windows,
+`GetConsoleMode`/`SetConsoleMode`/`ReadFile`/`WaitForSingleObject`/
+`GetConsoleScreenBufferInfo` — deliberately not ConPTY, which hosts a
+*child* process's console rather than this process's own). `lib.rs` itself
+never touches `libc`/`rusty_libc`/`rusty_win32`/`std::os::{unix,windows}`
+directly except for the history-file permission-bit calls (`0600` on Unix,
+no Windows equivalent — those few sites keep their own narrow
+`#[cfg(unix)]` gates). Non-tty stdin falls back to a plain read on both
+platforms. The Windows path has **no pseudo-terminal-driven behavioral
+test coverage** (`tests/pty.rs` is `#![cfg(unix)]`-only) — only
+compilation, `term_sys.rs`'s own pure bit-math unit tests, and whatever
+`rusty_win32` already verifies at the primitive layer on real
+`windows-latest` CI. Real interactive verification on Windows is still
+outstanding; treat Windows raw-mode changes with more caution than Unix
+ones for exactly that reason.
 
 The README's "Deliberate narrowings" section lists features that are
 intentionally NOT supported (multi-line buffer editing, programmable
