@@ -26,7 +26,7 @@ dependencies = [
 [[package]]
 name = "rusty_win32"
 version = "0.1.0"
-source = "git+https://github.com/baileyrd/rusty_win32?branch=main#c8b157d72c76d980fa346ef4801fe473448b869a"
+source = "git+https://github.com/baileyrd/rusty_win32?branch=main#853d99821749dc753620e8ae996fa8f1ad7105a2"
 
 [[package]]
 name = "unicode-width"
