@@ -30,6 +30,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn AllocConsole() -> i32;
+    fn GetStdHandle(std_handle: u32) -> rusty_win32::RawHandle;
     fn SetStdHandle(std_handle: u32, handle: rusty_win32::RawHandle) -> i32;
     fn CreateFileW(
         file_name: *const u16,
@@ -79,6 +80,29 @@ fn open_console(name: &str) -> Option<rusty_win32::RawHandle> {
     }
 }
 
+/// Points this process's own std-input/std-output handles at a real
+/// console for as long as it's alive, then restores the previous stdout
+/// handle on drop.
+///
+/// The restore matters: the test harness itself prints each test's
+/// `... ok`/`... FAILED` line (and the final summary) through this same
+/// process-wide `io::stdout()`, so if it stayed pointed at the console for
+/// the rest of the process's life, that output would silently vanish from
+/// the CI-captured log instead of reporting which test failed and why.
+struct ConsoleGuard {
+    stdin: rusty_win32::RawHandle,
+    prev_stdout: rusty_win32::RawHandle,
+}
+
+impl Drop for ConsoleGuard {
+    fn drop(&mut self) {
+        // SAFETY: `prev_stdout` is the handle `GetStdHandle` returned
+        // before this guard overwrote it, valid for the lifetime of the
+        // process.
+        unsafe { SetStdHandle(STD_OUTPUT_HANDLE, self.prev_stdout) };
+    }
+}
+
 /// Ensure this process has a real console (allocating one if needed — this
 /// sandbox can't confirm ahead of time whether `cargo test`'s
 /// `windows-latest` runner already provides one), and point this process's
@@ -88,8 +112,11 @@ fn open_console(name: &str) -> Option<rusty_win32::RawHandle> {
 /// every call — without this, they'd keep resolving to whatever (possibly
 /// redirected/invalid) handle the process started with, never seeing the
 /// console this test synthesizes input into.
-fn ensure_console() -> rusty_win32::RawHandle {
-    match (open_console("CONIN$"), open_console("CONOUT$")) {
+fn ensure_console() -> ConsoleGuard {
+    // SAFETY: `STD_OUTPUT_HANDLE` is a well-known pseudo-handle constant;
+    // this just reads the process's current stdout handle.
+    let prev_stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    let stdin = match (open_console("CONIN$"), open_console("CONOUT$")) {
         (Some(i), Some(o)) => {
             // SAFETY: both handles are real, valid, currently-open console
             // handles just opened above.
@@ -111,7 +138,8 @@ fn ensure_console() -> rusty_win32::RawHandle {
             }
             i
         }
-    }
+    };
+    ConsoleGuard { stdin, prev_stdout }
 }
 
 /// Drain and discard any input already queued (e.g. leftover from a
@@ -133,8 +161,9 @@ fn flush_pending_input(stdin: rusty_win32::RawHandle) {
 /// the read (`"\r"` for Enter, `"\x03"` for Ctrl-C, …) so the read doesn't
 /// block waiting for more input that never arrives.
 fn read_line_after_typing(text: &str) -> ReadResult {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let stdin = ensure_console();
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = ensure_console();
+    let stdin = guard.stdin;
     flush_pending_input(stdin);
     // SAFETY: `stdin` is a valid, real console input handle this test just
     // acquired/allocated.
@@ -176,8 +205,9 @@ fn ctrl_d_on_empty_line_is_eof() {
 
 #[test]
 fn history_recall_via_ctrl_p() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let stdin = ensure_console();
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = ensure_console();
+    let stdin = guard.stdin;
     flush_pending_input(stdin);
     let mut ed = Editor::new();
 
