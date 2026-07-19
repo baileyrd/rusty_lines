@@ -9,6 +9,19 @@
   `Cargo.toml`'s and the workflow's own comments on the gap this accepts).
   Real macOS/BSD behavior is unverified in CI now; verify by hand before
   a release if a change plausibly affects the `libc` backend specifically.
+- New `prepare_external_output()`: lets a `Hooks::on_interrupted_read`
+  implementation (already called on every ~200ms idle tick at the
+  prompt, not just on a real `EINTR`) print its own output — a shell's
+  background-job completion notice, say — without corrupting the
+  editor's next repaint. Fully additive: no `Hooks` trait signature
+  change, backed by a thread-local flag the existing self-heal repaint
+  branch (previously only triggered by a clobbered raw mode or a
+  resize) now also checks. New pty test
+  (`prepare_external_output_prints_cleanly_while_idle_and_keeps_the_line`,
+  via a new `examples/notify` demo) proves the notice lands on its own
+  line and an in-progress buffer survives intact around it, the same
+  shape `resize_while_idle_repaints_and_keeps_the_line` already proves
+  for a resize.
 - Windows raw-mode editing: `term_sys.rs` grows a `rusty_win32`-backed
   Windows implementation of its termios-shaped interface
   (`GetConsoleMode`/`SetConsoleMode`/`ReadFile`/`WaitForSingleObject`/
