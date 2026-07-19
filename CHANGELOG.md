@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- CI: dropped the `macos-latest` leg of the `test` job — GitHub Actions'
+  macOS runners routinely took far longer to even start than every other
+  job combined, for coverage `Feature (libc-backend)` already gives the
+  same `libc`-crate code path (just on Linux, not real macOS/BSD — see
+  `Cargo.toml`'s and the workflow's own comments on the gap this accepts).
+  Real macOS/BSD behavior is unverified in CI now; verify by hand before
+  a release if a change plausibly affects the `libc` backend specifically.
 - Windows raw-mode editing: `term_sys.rs` grows a `rusty_win32`-backed
   Windows implementation of its termios-shaped interface
   (`GetConsoleMode`/`SetConsoleMode`/`ReadFile`/`WaitForSingleObject`/

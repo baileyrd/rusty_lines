@@ -35,7 +35,11 @@ rusty_libc = { git = "https://github.com/baileyrd/rusty_libc", branch = "main", 
 libc = { version = "0.2", optional = true }
 
 # Other Unix (macOS/BSD): the libc backend is the only option — `rusty_libc` is
-# Linux-only — so libc is a plain dependency there.
+# Linux-only — so libc is a plain dependency there. Not CI-verified on a real
+# macOS/BSD runner (CI dropped its macos-latest job — see
+# .github/workflows/ci.yml's `libc-backend` comment); this code path is
+# exercised on Linux only, via that job's `--features libc-backend` escape
+# hatch.
 [target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
 libc = "0.2"
 
