@@ -16,8 +16,10 @@ other change.
 
 ## 1. Pre-flight
 
-- [ ] `main` is green in CI — all six jobs (Linux/macOS tests, Windows
-      check, `Feature (libc-backend)`, clippy+rustfmt+doc, MSRV).
+- [ ] `main` is green in CI — all five jobs (Linux test, Windows check,
+      `Feature (libc-backend)`, clippy+rustfmt+doc, MSRV). No macOS job —
+      see `.github/workflows/ci.yml`'s own comment on the `libc-backend`
+      job for why that's an accepted gap, not an oversight.
 - [ ] Local checkout is synced to `main` with a clean tree.
 - [ ] Full local sweep passes:
 

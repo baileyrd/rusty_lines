@@ -11,11 +11,8 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: Test (ubuntu-latest)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable
@@ -35,8 +32,13 @@ jobs:
 
   libc-backend:
     # rusty_libc is the default backend on Linux, so the plain test job
-    # already covers it; this exercises the libc escape hatch, which
-    # otherwise only builds on macOS.
+    # already covers it; this exercises the libc crate escape hatch
+    # instead — the same code path "other Unix" targets (macOS/BSD) use
+    # unconditionally (see Cargo.toml), though only ever actually run
+    # here on Linux: CI dropped its macos-latest job (slow runner queue
+    # times, no coverage this job doesn't already give the libc-crate
+    # path itself), so real macOS/BSD behavior is unverified in CI —
+    # verified by hand instead, when it matters.
     name: Feature (libc-backend)
     runs-on: ubuntu-latest
     steps:
