@@ -34,14 +34,19 @@ pub trait Hooks {
     fn expand_abbreviation(&self, line: &str, cursor: usize) -> Option<(usize, String)>;
     fn vi_mode(&self) -> bool;              // checked live, per read_line
     fn external_editor(&self) -> Option<String>; // C-x C-e; falls back $VISUAL/$EDITOR/vi
-    fn on_interrupted_read(&self);          // EINTR: fire pending signal traps
+    fn on_interrupted_read(&self);          // EINTR, and every idle tick: fire pending signal traps
     fn host_binding(&self, tag: &str, line: &mut String, cursor: &mut usize); // bind -x
 }
 ```
 
+A hook that wants to print its own output from `on_interrupted_read`
+(a shell reporting a background job's completion while idle at the
+prompt, say) calls `prepare_external_output()` first — see its own doc
+comment for why the ordering matters.
+
 Try it: `cargo run --example demo` — or `hooked` (completion, hints,
 host bindings), `vi` (vi mode + mode indicator), `rprompt`,
-`initial`, and `timeout`.
+`initial`, `timeout`, and `notify` (`prepare_external_output`).
 
 ## Benchmarks
 

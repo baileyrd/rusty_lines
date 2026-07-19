@@ -133,8 +133,15 @@ pub trait Hooks {
     fn external_editor(&self) -> Option<String> {
         None
     }
-    /// Called when a signal interrupts the blocking read (`EINTR`) —
-    /// a shell fires its pending traps here. The read then resumes.
+    /// Called when a signal interrupts the blocking read (`EINTR`), and
+    /// also on every ~200ms idle tick while sitting at the prompt with
+    /// nothing typed — a shell fires its pending traps here either way.
+    /// The read then resumes. A hook that wants to print something of its
+    /// own from here (not just check state) — e.g. a background job's
+    /// completion notice — must call [`prepare_external_output`] first,
+    /// every time, before writing anything: printing without it corrupts
+    /// the editor's next repaint, since `render`'s own paint logic assumes
+    /// the cursor is exactly where it left it.
     fn on_interrupted_read(&self) {}
     /// Invoked for a key bound via [`Editor::bind_host`] — bash's
     /// `bind -x` contract. The editor suspends raw mode, hands over the
@@ -504,6 +511,41 @@ pub enum ReadResult {
 /// (bash 5's `checkwinsize` default).
 pub fn terminal_size() -> Option<(u16, u16)> {
     term_sys::term_size_stdout()
+}
+
+thread_local! {
+    /// Set by [`prepare_external_output`], consumed the next time the idle
+    /// tick inside `read_line_raw`'s wait loop reaches its own repaint
+    /// check (`lib.rs`'s self-heal branch) — at most one wait-loop pass
+    /// away, since that loop runs on every "waiting for the next key"
+    /// cycle regardless of whether anything actually changed.
+    static EXTERNAL_OUTPUT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Interrupt the current prompt/buffer's on-screen paint for output a
+/// [`Hooks`] implementation wants to print outside the editor's own
+/// rendering — e.g. a shell's background-job completion notice, printed
+/// from [`Hooks::on_interrupted_read`] while idle at the prompt with a
+/// partial line already typed. Moves to a fresh line immediately and marks
+/// the region for a full repaint at the next safe point; the editor
+/// redraws the prompt and buffer automatically once the hook call that
+/// invoked this returns — the caller doesn't drive the repaint itself.
+///
+/// Call this *before* printing, not after: `render`'s own paint logic
+/// assumes the cursor is exactly where the previous `render` call left it
+/// (it moves up a fixed number of rows to get back to the top of the
+/// region), so text written to the terminal without first resetting that
+/// bookkeeping corrupts the next repaint's row math, not just its
+/// content — the same reason the existing self-heal logic (an external
+/// `stty` leaving the terminal cooked, or a mid-edit resize) already does
+/// its own reset-then-newline *before* repainting, never after.
+///
+/// A no-op outside the raw-mode interactive editor (the piped-stdin path
+/// has no on-screen paint to protect in the first place) — still safe to
+/// call unconditionally.
+pub fn prepare_external_output() -> io::Result<()> {
+    EXTERNAL_OUTPUT_PENDING.with(|f| f.set(true));
+    writeln!(io::stdout())
 }
 
 /// Run `f` with terminal echo off (a shell's `read -s`), restoring the
@@ -2167,6 +2209,22 @@ fn read_line_raw(
                 break;
             }
             hooks.on_interrupted_read();
+            // A hook called `prepare_external_output` (e.g. a shell
+            // printing a background job's completion notice) — it already
+            // moved to a fresh line and wrote its own text there; this
+            // just resets the paint bookkeeping so the repaint below
+            // starts fresh from here instead of trying to move up through
+            // rows that no longer hold what it thinks they do. No
+            // `writeln!` here (unlike the raw-mode branch just below) —
+            // `prepare_external_output` already did that itself.
+            if EXTERNAL_OUTPUT_PENDING.with(|f| f.replace(false)) {
+                st.painted_rows = 1;
+                st.painted_cursor_row = 0;
+                st.fresh_region = true;
+                render(&mut st, history)?;
+                st.render_owed = false; // just painted for real
+                st.coalesced_run = 0;
+            }
             // Self-healing raw mode: an external SIGTSTP + `fg` (the
             // parent shell restores *its* termios on continue), or a
             // trap/host command that ran `stty`, leaves the terminal

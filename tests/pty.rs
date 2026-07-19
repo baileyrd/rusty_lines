@@ -21,7 +21,7 @@ fn example_path(name: &str) -> std::path::PathBuf {
     p
 }
 
-fn spawn_example(name: &str) -> (OwnedFd, Child) {
+fn spawn_example(name: &str, args: &[&str]) -> (OwnedFd, Child) {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
     let mut ws = libc::winsize {
@@ -45,6 +45,7 @@ fn spawn_example(name: &str) -> (OwnedFd, Child) {
     let master = unsafe { OwnedFd::from_raw_fd(master) };
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     let child = Command::new(example_path(name))
+        .args(args)
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave))
@@ -105,7 +106,7 @@ fn run_session(chunks: &[&[u8]]) -> String {
 }
 
 fn run_session_in(example: &str, prompt: &str, chunks: &[&[u8]]) -> String {
-    let (master, mut child) = spawn_example(example);
+    let (master, mut child) = spawn_example(example, &[]);
     let mut m = std::fs::File::from(master.try_clone().unwrap());
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut out = Vec::new();
@@ -513,7 +514,7 @@ fn multiline_prompt_prefix_paints_once_per_region() {
 fn read_line_with_initial_seeds_buffer_and_cursor() {
     // The initial example pre-seeds "hello " ∥ "world" with the cursor at
     // the split; typing X then Enter must yield "hello Xworld".
-    let (master, mut child) = spawn_example("initial");
+    let (master, mut child) = spawn_example("initial", &[]);
     let mut m = std::fs::File::from(master.try_clone().unwrap());
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut out = Vec::new();
@@ -551,7 +552,7 @@ fn rprompt_paints_and_hides_when_the_line_grows_into_it() {
     // the line is short, and hides it (zsh-style) once the buffer grows
     // into it: at 80 columns, prompt "rp> " (4) + 72 chars + gap leaves
     // no room for the 5-wide rprompt.
-    let (master, mut child) = spawn_example("rprompt");
+    let (master, mut child) = spawn_example("rprompt", &[]);
     let mut m = std::fs::File::from(master.try_clone().unwrap());
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut out = Vec::new();
@@ -599,7 +600,7 @@ fn rprompt_paints_and_hides_when_the_line_grows_into_it() {
 fn read_line_timeout_expires_at_the_prompt() {
     // Sit at the timeout example's prompt without typing: the 2s deadline
     // must fire, print bash's message, and exit cleanly.
-    let (master, mut child) = spawn_example("timeout");
+    let (master, mut child) = spawn_example("timeout", &[]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut out = Vec::new();
     wait_for_prompt(&master, &mut out, deadline, "timeout> ");
@@ -628,7 +629,7 @@ fn resize_while_idle_repaints_and_keeps_the_line() {
     // Type half a line, shrink the terminal while the editor idles at
     // the prompt (no keystroke pending), then finish the line: the idle
     // poll tick must notice the new width and nothing may be lost.
-    let (master, mut child) = spawn_example("demo");
+    let (master, mut child) = spawn_example("demo", &[]);
     let mut m = std::fs::File::from(master.try_clone().unwrap());
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut out = Vec::new();
@@ -659,5 +660,50 @@ fn resize_while_idle_repaints_and_keeps_the_line() {
     assert!(
         out.contains(&echo("abcdef")),
         "line lost across resize:\n{out}"
+    );
+}
+
+#[test]
+fn prepare_external_output_prints_cleanly_while_idle_and_keeps_the_line() {
+    // Type half a line, then — without pressing Enter — let a hook print a
+    // notice via `prepare_external_output` from the idle tick: the same
+    // "idle at the prompt, an external event needs to interrupt the
+    // paint" shape `resize_while_idle_repaints_and_keeps_the_line` covers
+    // for a resize, exercised here for a hook's own printed output
+    // instead. Proves both that the notice lands on its own line (not
+    // glued onto the in-progress buffer) and that the buffer itself
+    // survives intact once the line is finished.
+    let trigger =
+        std::env::temp_dir().join(format!("rusty_lines_notify_trigger_{}", std::process::id()));
+    let _ = std::fs::remove_file(&trigger);
+    let (master, mut child) = spawn_example("notify", &[trigger.to_str().unwrap()]);
+    let mut m = std::fs::File::from(master.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    wait_for_prompt(&master, &mut out, deadline, "notify> ");
+    m.write_all(b"abc").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::write(&trigger, b"").unwrap(); // fires the hook's next idle tick
+    std::thread::sleep(Duration::from_millis(500)); // > one idle tick
+    m.write_all(b"def\r").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    wait_for_prompt(&master, &mut out, deadline, "notify> ");
+    m.write_all(b"\x04").unwrap();
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "notify did not exit");
+    }
+    child.wait().unwrap();
+    let _ = std::fs::remove_file(&trigger);
+    let out = strip_ansi(&out);
+    assert!(
+        out.contains("\r\n[1]+  Done\tsleep 5\r\n"),
+        "notice missing or not on its own line:\n{out}"
+    );
+    assert!(
+        out.contains(&echo("abcdef")),
+        "line lost around external output:\n{out}"
     );
 }
