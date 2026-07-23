@@ -272,10 +272,12 @@ either niche, terminal-hostile, or a different program's job:
   crate's two-dependency budget, while terminals themselves disagree on
   cluster widths — the common-case behavior (wide CJK, zero-width
   combining marks) is what `unicode-width` already gives.
-- **Non-tty / non-Unix**: a piped stdin *or* stdout gets a plain line
-  read (there is nothing to repaint on a pipe); when stdin is still a
-  terminal, the prompt goes to stderr, bash's rule, so the user sees
-  where to type. Non-Unix builds get a buffered prompt-and-read.
+- **Non-tty**: a piped stdin *or* stdout gets a plain line read (there
+  is nothing to repaint on a pipe); when stdin is still a terminal, the
+  prompt goes to stderr, bash's rule, so the user sees where to type.
+  Applies equally on Windows and Unix — raw-mode editing itself is not
+  a narrowing on either platform (see the README's "Platforms"
+  section).
 
 ## Maintaining this document
 
