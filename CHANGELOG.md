@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Test coverage: a parity audit against `docs/survey.md`'s capability
+  table found every documented capability genuinely implemented (no
+  functional gaps), but 12 specific sub-behaviors named in that table had
+  no test anywhere — `quoted_insert`'s literal control byte, the
+  `C-x C-e`/`v` external-editor round-trip, `read_line_with_initial_timeout`
+  as a combined seed+deadline call, the rustyline `#V2` history-header
+  skip, `bell()` actually emitting `BellStyle::Audible`/`Visible` output,
+  the `completion_query_items` y/n prompt and column-major candidate
+  layout, plain (non-edge-case) abbreviation expansion, a multi-line
+  bracketed paste end-to-end (live `⏎` render, single-unit insert, `; `
+  -joined history recall), an unrecognized/private-mode CSI sequence being
+  consumed whole instead of leaking into the buffer, raw-mode self-healing
+  after an external cooked-mode change (approximating SIGTSTP+`fg` or a
+  stray `stty`), `set_completion_ignore_case`/`set_show_all_if_ambiguous`
+  actually changing behavior, and `terminal_size()`/`with_echo_disabled`
+  (including panic-safety). All 12 now have unit or pty coverage; no
+  production code changed — every one of the 12 was already correct.
+  `docs/survey.md`'s "Deliberate narrowings" section also had one stale
+  line (still claimed non-Unix builds get a buffered prompt-and-read,
+  predating the Windows raw-mode backend) — fixed to match README.md's
+  already-corrected copy.
 - CI: dropped the `macos-latest` leg of the `test` job — GitHub Actions'
   macOS runners routinely took far longer to even start than every other
   job combined, for coverage `Feature (libc-backend)` already gives the
