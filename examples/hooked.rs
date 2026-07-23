@@ -6,7 +6,9 @@
 //! Tab completes from a fixed word list; typing shows a dimmed hint from
 //! history (Right/End accepts it, M-f accepts one word); C-o is rebound
 //! to unix-line-discard and C-g runs a host binding that uppercases the
-//! line (bash `bind -x` style). Ctrl-D on an empty line exits.
+//! line (bash `bind -x` style). C-x C-e hands the line to a fake
+//! `$EDITOR` that deterministically overwrites it (for the pty test).
+//! Ctrl-D on an empty line exits.
 
 use rusty_lines::{Candidate, Editor, EditorAction, Hooks, ReadResult};
 
@@ -48,6 +50,12 @@ impl Hooks for DemoHooks {
             *line = line.to_uppercase();
             *cursor = line.len();
         }
+    }
+
+    fn external_editor(&self) -> Option<String> {
+        // Deterministic stand-in for $VISUAL/$EDITOR, for the pty test:
+        // overwrites the tempfile instead of opening a real editor.
+        Some("printf EDITED-VIA-EXTERNAL >".to_string())
     }
 }
 

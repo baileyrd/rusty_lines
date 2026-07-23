@@ -22,11 +22,21 @@ fn example_path(name: &str) -> std::path::PathBuf {
 }
 
 fn spawn_example(name: &str, args: &[&str]) -> (OwnedFd, Child) {
+    let (master, _slave_for_test, child) = spawn_example_ext(name, args, 80, 24);
+    (master, child)
+}
+
+/// [`spawn_example`], but with a caller-chosen pty size and a second fd
+/// onto the same tty handed back for the test itself to use — e.g.
+/// twiddling termios directly (an external `stty`, or a SIGTSTP+`fg`
+/// cycle's cooked-mode aftermath) or reading the window size independent
+/// of what the child believes it is.
+fn spawn_example_ext(name: &str, args: &[&str], cols: u16, rows: u16) -> (OwnedFd, OwnedFd, Child) {
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
     let mut ws = libc::winsize {
-        ws_row: 24,
-        ws_col: 80,
+        ws_row: rows,
+        ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
@@ -44,6 +54,7 @@ fn spawn_example(name: &str, args: &[&str]) -> (OwnedFd, Child) {
     assert_eq!(rc, 0, "openpty failed");
     let master = unsafe { OwnedFd::from_raw_fd(master) };
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    let slave_for_test = slave.try_clone().unwrap();
     let child = Command::new(example_path(name))
         .args(args)
         .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -51,7 +62,17 @@ fn spawn_example(name: &str, args: &[&str]) -> (OwnedFd, Child) {
         .stderr(Stdio::from(slave))
         .spawn()
         .expect("spawn demo (is it built? cargo test builds examples)");
-    (master, child)
+    (master, slave_for_test, child)
+}
+
+/// Whether `ECHO` is currently set on the tty `fd` refers to — polled
+/// from the test side, independent of the child's own view of its
+/// terminal.
+fn termios_echo_on(fd: &OwnedFd) -> bool {
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut term) };
+    assert_eq!(rc, 0, "tcgetattr failed");
+    term.c_lflag & libc::ECHO != 0
 }
 
 /// Read whatever the pty has within `timeout_ms`, appending to `out`.
@@ -706,4 +727,487 @@ fn prepare_external_output_prints_cleanly_while_idle_and_keeps_the_line() {
         out.contains(&echo("abcdef")),
         "line lost around external output:\n{out}"
     );
+}
+
+#[test]
+fn quoted_insert_and_edit_in_editor_pty_smoke() {
+    // quoted_insert (C-v/C-q) itself is unit-tested in src/lib.rs against
+    // synthetic stdin; this just confirms it also works end-to-end under
+    // a real pty: C-v C-a inserts the literal ^A byte instead of running
+    // beginning-of-line, and the render shows it ^X-style.
+    let out = run_session_in("demo", "demo> ", &[b"x\x16\x01y", b"\r"]);
+    assert!(
+        out.contains("x^Ay"),
+        "quoted-insert did not render the literal control byte ^X-style:\n{out}"
+    );
+}
+
+#[test]
+fn edit_in_editor_rewrites_the_line_via_external_editor() {
+    // hooked's external_editor hook deterministically overwrites the
+    // tempfile; C-x C-e must hand the buffer to it and accept whatever
+    // comes back, exactly like accepting the line normally.
+    let out = run_session_in("hooked", "hooked> ", &[b"orig", b"\x18\x05"]);
+    assert!(
+        out.contains(&echo("EDITED-VIA-EXTERNAL")),
+        "external editor's rewrite was not accepted as the line:\n{out}"
+    );
+}
+
+#[test]
+fn read_line_with_initial_timeout_preserves_seeded_and_edited_buffer() {
+    // The combined seed+deadline variant: type into the seeded buffer,
+    // then let the deadline expire without pressing Enter. TimedOut
+    // itself carries no buffer (see ReadResult::TimedOut), but the
+    // seeded-then-edited text must still be the last thing painted.
+    let (master, mut child) = spawn_example("initial_timeout", &[]);
+    let mut m = std::fs::File::from(master.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    loop {
+        if strip_ansi(&out).contains("hello world") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "seeded line never painted:\n{}",
+            strip_ansi(&out)
+        );
+        drain(&master, &mut out, 100);
+    }
+    m.write_all(b"X").unwrap(); // edit the seeded buffer; never press Enter
+    m.flush().unwrap();
+    loop {
+        if strip_ansi(&out).contains("hello Xworld") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "edit never painted:\n{}",
+            strip_ansi(&out)
+        );
+        drain(&master, &mut out, 100);
+    }
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial_timeout demo did not exit:\n{}",
+            strip_ansi(&out)
+        );
+    }
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "initial_timeout demo exited with {status}"
+    );
+    drain(&master, &mut out, 200);
+    let out = strip_ansi(&out);
+    assert!(
+        out.contains("hello Xworld"),
+        "seeded+edited buffer not preserved on screen at the deadline:\n{out}"
+    );
+    assert!(
+        out.contains("timed out waiting for input"),
+        "TimedOut message missing:\n{out}"
+    );
+}
+
+#[test]
+fn history_past_end_rings_the_default_audible_bell() {
+    // BellStyle::Audible is the default; Up-arrow before anything is
+    // typed hits history_prev's "nothing to recall" bell. A bare BEL
+    // isn't ESC-introduced, so it survives ANSI-stripping untouched —
+    // this also exercises BellStyle::Audible for item 11(c).
+    let (master, mut child) = spawn_example("demo", &[]);
+    let mut m = std::fs::File::from(master.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    wait_for_prompt(&master, &mut out, deadline, "demo> ");
+    m.write_all(b"\x1b[A").unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    drain(&master, &mut out, 0);
+    assert!(
+        strip_ansi(&out).contains('\x07'),
+        "no audible BEL byte on history past-end:\n{}",
+        strip_ansi(&out)
+    );
+    m.write_all(b"\x04").unwrap();
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "demo did not exit");
+    }
+    child.wait().unwrap();
+}
+
+#[test]
+fn bell_style_visible_flashes_reverse_video() {
+    // BellStyle::Visible writes CSI ?5h / ?5l (a reverse-video flash) —
+    // both get eaten by ANSI-stripping, so this reads the pty's raw
+    // bytes directly instead of going through strip_ansi.
+    let (master, mut child) = spawn_example("bell_visible", &[]);
+    let mut m = std::fs::File::from(master.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    wait_for_prompt(&master, &mut out, deadline, "bell> ");
+    m.write_all(b"\x1b[A").unwrap();
+    std::thread::sleep(Duration::from_millis(250)); // the flash itself holds ~80ms
+    drain(&master, &mut out, 0);
+    let raw = String::from_utf8_lossy(&out);
+    assert!(
+        raw.contains("\x1b[?5h"),
+        "reverse-video set sequence missing:\n{raw}"
+    );
+    assert!(
+        raw.contains("\x1b[?5l"),
+        "reverse-video unset sequence missing:\n{raw}"
+    );
+    m.write_all(b"\x04").unwrap();
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "bell_visible demo did not exit");
+    }
+    child.wait().unwrap();
+}
+
+#[test]
+fn completion_query_items_prompts_above_threshold_and_y_shows_the_list() {
+    let out = run_session_in("query_items", "qi> ", &[b"\t", b"y", b"\r"]);
+    assert!(
+        out.contains("Display all 3 possibilities? (y or n)"),
+        "completion-query-items prompt missing:\n{out}"
+    );
+    assert!(
+        out.contains("alpha") && out.contains("beta") && out.contains("gamma"),
+        "candidate list missing after answering y:\n{out}"
+    );
+}
+
+#[test]
+fn completion_query_items_declining_hides_the_list() {
+    let out = run_session_in("query_items", "qi> ", &[b"\t", b"n", b"\r"]);
+    assert!(
+        out.contains("Display all 3 possibilities? (y or n)"),
+        "completion-query-items prompt missing:\n{out}"
+    );
+    assert!(
+        !out.contains("alpha"),
+        "candidate list printed despite declining:\n{out}"
+    );
+}
+
+#[test]
+fn candidate_columns_print_column_major_not_row_major() {
+    // 8 same-width, no-common-prefix candidates wrap into 4 columns x 2
+    // rows at 80 columns. Column-major order is 0,2,4,6,1,3,5,7 — so "g"
+    // (index 6) must appear before "b" (index 1) in the printed text;
+    // row-major would print "b" (row 0) before "g" (row 1).
+    let out = run_session_in("columns", "cols> ", &[b"\t", b"\r"]);
+    let pos_b = out
+        .find("b-marker-item-01")
+        .expect("candidate b missing from the list");
+    let pos_g = out
+        .find("g-marker-item-06")
+        .expect("candidate g missing from the list");
+    assert!(
+        pos_g < pos_b,
+        "candidates were not laid out column-major:\n{out}"
+    );
+}
+
+#[test]
+fn bracketed_paste_multiline_end_to_end() {
+    // A multi-line bracketed paste: the embedded newline must render as
+    // ⏎ live (not break the edit region), the whole block inserts as one
+    // literal unit (not two executed lines), and — once accepted —
+    // recalling it from history shows the "; "-joined form (src/lib.rs's
+    // multi-line history entries).
+    let (master, mut child) = spawn_example("demo", &[]);
+    let mut m = std::fs::File::from(master.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    wait_for_prompt(&master, &mut out, deadline, "demo> ");
+
+    m.write_all(b"\x1b[200~line1\nline2\x1b[201~").unwrap();
+    m.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    drain(&master, &mut out, 0);
+    let live = strip_ansi(&out);
+    assert!(
+        live.contains('⏎'),
+        "pasted newline not shown as ⏎ in the live display:\n{live}"
+    );
+    assert!(
+        !live.contains(&echo("line1")),
+        "paste executed line-by-line instead of inserting as one literal unit:\n{live}"
+    );
+
+    m.write_all(b"\r").unwrap();
+    m.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    wait_for_prompt(&master, &mut out, deadline, "demo> ");
+    let after_accept = strip_ansi(&out);
+    let idx1 = after_accept
+        .find("line1")
+        .expect("line1 missing after accept");
+    let idx2 = after_accept
+        .find("line2")
+        .expect("line2 missing after accept");
+    assert!(idx2 > idx1, "pasted lines out of order:\n{after_accept}");
+    assert!(
+        !after_accept[idx1..idx2].contains("demo> "),
+        "a prompt reappeared between the two pasted lines — executed separately:\n{after_accept}"
+    );
+
+    // Recall it: the in-memory history entry is joined with "; ".
+    m.write_all(b"\x1b[A\r").unwrap();
+    m.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    wait_for_prompt(&master, &mut out, deadline, "demo> ");
+    m.write_all(b"\x04").unwrap();
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "demo did not exit");
+    }
+    child.wait().unwrap();
+    let out = strip_ansi(&out);
+    assert!(
+        out.contains(&echo("line1; line2")),
+        "recalled multi-line entry not joined with \"; \":\n{out}"
+    );
+}
+
+#[test]
+fn self_heals_raw_mode_after_external_cooked_mode() {
+    // Approximates SIGTSTP + `fg` (the parent shell restores its own
+    // cooked termios on continue) or a trap that ran `stty`: something
+    // outside the editor leaves the terminal cooked while it idles at
+    // the prompt. The idle poll tick must notice and re-assert raw mode
+    // before the next keystroke would otherwise be swallowed by the
+    // kernel's line-buffered/echoing canonical mode.
+    let (master, slave, mut child) = spawn_example_ext("demo", &[], 80, 24);
+    let mut m = std::fs::File::from(master.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    wait_for_prompt(&master, &mut out, deadline, "demo> ");
+    m.write_all(b"abc").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut term) };
+    assert_eq!(rc, 0, "tcgetattr failed");
+    term.c_lflag |= libc::ICANON | libc::ECHO;
+    let rc = unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &term) };
+    assert_eq!(rc, 0, "tcsetattr failed");
+
+    std::thread::sleep(Duration::from_millis(500)); // > one idle tick
+    m.write_all(b"def\r").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    wait_for_prompt(&master, &mut out, deadline, "demo> ");
+    m.write_all(b"\x04").unwrap();
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "demo did not exit");
+    }
+    child.wait().unwrap();
+    let out = strip_ansi(&out);
+    assert!(
+        out.contains(&echo("abcdef")),
+        "line lost or corrupted after external cooked-mode reassertion:\n{out}"
+    );
+}
+
+/// A fresh, empty directory for [`terminal_facilities`]'s trigger-file
+/// handshake — a caller-controlled substitute for a fixed sleep, so the
+/// test dictates exactly when the example advances to its next phase
+/// regardless of how the test binary happens to be scheduled.
+fn trigger_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("rusty_lines_trig_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Create `dir`'s trigger file and block until `terminal_facilities` has
+/// picked it up (deletes it once seen) — the send half of the handshake.
+fn release(dir: &std::path::Path, name: &str, deadline: Instant) {
+    let path = dir.join(name);
+    std::fs::write(&path, b"").unwrap();
+    while path.exists() {
+        assert!(Instant::now() < deadline, "example never consumed {name}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn terminal_size_reports_the_pty_dimensions() {
+    let dir = trigger_dir("size");
+    let (master, _slave, mut child) =
+        spawn_example_ext("terminal_facilities", &[dir.to_str().unwrap()], 97, 31);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    loop {
+        if strip_ansi(&out).contains("size:") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal_facilities never reported a size:\n{}",
+            strip_ansi(&out)
+        );
+        drain(&master, &mut out, 100);
+    }
+    // This test only cares about the reported size; release the example
+    // through both of its (unconditional) trigger gates so it can exit.
+    release(&dir, "go1", deadline);
+    release(&dir, "go2", deadline);
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal_facilities did not exit"
+        );
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success(), "terminal_facilities exited with {status}");
+    let out = strip_ansi(&out);
+    assert!(
+        out.contains("size:97x31"),
+        "terminal_size() did not report the configured pty dimensions:\n{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn with_echo_disabled_clears_and_restores_echo_including_after_a_panic() {
+    let dir = trigger_dir("echo");
+    let (master, slave, mut child) = spawn_example_ext(
+        "terminal_facilities",
+        &[dir.to_str().unwrap(), "--panic"],
+        80,
+        24,
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+
+    // Baseline: before the guard runs (the example is blocked waiting
+    // for "go1"), the pty's ECHO flag is on.
+    loop {
+        if strip_ansi(&out).contains("before-disable") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "example never reached before-disable:\n{}",
+            strip_ansi(&out)
+        );
+        drain(&master, &mut out, 100);
+    }
+    assert!(
+        termios_echo_on(&slave),
+        "ECHO expected on before the guard runs"
+    );
+
+    // Mid-guard: release it into with_echo_disabled's closure, which
+    // prints then blocks on "go2" — still inside the guard's scope.
+    release(&dir, "go1", deadline);
+    loop {
+        if strip_ansi(&out).contains("during-disable") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "example never reached during-disable:\n{}",
+            strip_ansi(&out)
+        );
+        drain(&master, &mut out, 100);
+    }
+    assert!(
+        !termios_echo_on(&slave),
+        "ECHO not cleared during with_echo_disabled"
+    );
+
+    // Release it out of the closure: the guard drops, restoring echo,
+    // before "after-disable" prints and it blocks on "go3".
+    release(&dir, "go2", deadline);
+    loop {
+        if strip_ansi(&out).contains("after-disable") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "example never reached after-disable:\n{}",
+            strip_ansi(&out)
+        );
+        drain(&master, &mut out, 100);
+    }
+    assert!(
+        termios_echo_on(&slave),
+        "ECHO not restored after with_echo_disabled returns"
+    );
+
+    // Mid-guard again, but this time the closure panics instead of
+    // returning normally: release into it, then wait for it to print and
+    // block on "go4" before panicking.
+    release(&dir, "go3", deadline);
+    loop {
+        if strip_ansi(&out).contains("during-panic") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "example never reached during-panic:\n{}",
+            strip_ansi(&out)
+        );
+        drain(&master, &mut out, 100);
+    }
+    assert!(
+        !termios_echo_on(&slave),
+        "ECHO not cleared during the panicking closure"
+    );
+
+    release(&dir, "go4", deadline);
+    loop {
+        if strip_ansi(&out).contains("panicked:true") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "panic was not caught:\n{}",
+            strip_ansi(&out)
+        );
+        drain(&master, &mut out, 100);
+    }
+    assert!(
+        termios_echo_on(&slave),
+        "ECHO not restored after the closure panicked (panic-safety broken)"
+    );
+
+    loop {
+        if !drain(&master, &mut out, 200) || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal_facilities --panic did not exit"
+        );
+    }
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "terminal_facilities --panic exited with {status}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

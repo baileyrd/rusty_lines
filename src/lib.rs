@@ -5998,4 +5998,135 @@ mod tests {
         assert_eq!(st.buffer, "he");
         assert_eq!(st.cursor, 2);
     }
+
+    /// Fill [`STDIN_BUF`] as if these bytes had just arrived off fd 0 —
+    /// lets a test drive `read_byte`/`read_key` (and anything built on
+    /// them, like `quoted_insert`) without a real terminal.
+    fn feed_stdin(bytes: &[u8]) {
+        STDIN_BUF.with(|b| {
+            let (data, pos) = &mut *b.borrow_mut();
+            data.clear();
+            data.extend_from_slice(bytes);
+            *pos = 0;
+        });
+    }
+
+    #[test]
+    fn quoted_insert_inserts_the_raw_control_byte() {
+        // C-v C-a: the ^A byte lands in the buffer literally instead of
+        // running beginning-of-line, and renders ^X-style.
+        let mut st = state("", 0);
+        let mut ring = VecDeque::new();
+        feed_stdin(&[0x01]);
+        run_action(
+            &mut st,
+            EditorAction::QuotedInsert,
+            &Key::Ctrl('v'),
+            &[],
+            &mut ring,
+        )
+        .unwrap();
+        assert_eq!(st.buffer, "\u{1}");
+        assert_eq!(st.cursor, 1);
+        assert_eq!(visualize(&st.buffer, 0), "^A");
+    }
+
+    #[test]
+    fn unrecognized_csi_sequence_is_consumed_whole() {
+        // An SGR mouse report (ESC[<65;5;10M): the `<` intermediate takes
+        // the private-mode/intermediate path, so the whole sequence must
+        // be swallowed as one Key::Other instead of leaking its tail
+        // ("65;5;10M") into the buffer as typed text. The plain 'x' right
+        // after proves nothing leaked.
+        feed_stdin(b"\x1b[<65;5;10Mx");
+        assert_eq!(read_key(&NoHooks).unwrap(), Some(Key::Other));
+        assert_eq!(read_key(&NoHooks).unwrap(), Some(Key::Char('x')));
+    }
+
+    #[test]
+    fn load_history_skips_the_v2_header() {
+        let path =
+            std::env::temp_dir().join(format!("rusty_lines_v2_header_test_{}", std::process::id()));
+        std::fs::write(&path, "#V2\nfoo\nbar\n").unwrap();
+        let mut ed = Editor::new();
+        ed.load_history(&path).unwrap();
+        assert_eq!(ed.history(), &["foo", "bar"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn abbreviation_expands_on_space() {
+        struct H;
+        impl Hooks for H {
+            fn expand_abbreviation(&self, line: &str, cursor: usize) -> Option<(usize, String)> {
+                (&line[..cursor] == "gco").then(|| (0, "git checkout".to_string()))
+            }
+        }
+        let mut st = state_hooked("gco", 3, &H);
+        let mut ring = VecDeque::new();
+        run_action(
+            &mut st,
+            EditorAction::SelfInsert,
+            &Key::Char(' '),
+            &[],
+            &mut ring,
+        )
+        .unwrap();
+        assert_eq!(st.buffer, "git checkout ");
+        assert_eq!(st.cursor, 13);
+    }
+
+    #[test]
+    fn completion_ignore_case_matches_regardless_of_case() {
+        struct H;
+        impl Hooks for H {
+            fn complete(&self, _line: &str, _pos: usize) -> (usize, Vec<Candidate>) {
+                let cand = |s: &str| Candidate {
+                    display: s.to_string(),
+                    replacement: s.to_string(),
+                };
+                (0, vec![cand("Echo"), cand("echelon")])
+            }
+        }
+        let mut ring = VecDeque::new();
+        // Off (default): 'E' vs 'e' differ, so there is no common prefix
+        // to insert.
+        let mut st = state_hooked("", 0, &H);
+        run_action(&mut st, EditorAction::Complete, &Key::Tab, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "");
+        // On: the case-insensitive common prefix "Ech" (first candidate's
+        // spelling) is inserted.
+        let mut st = state_hooked("", 0, &H);
+        st.cfg.completion_ignore_case = true;
+        run_action(&mut st, EditorAction::Complete, &Key::Tab, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "Ech");
+    }
+
+    #[test]
+    fn show_all_if_ambiguous_lists_immediately_on_first_tab() {
+        struct H;
+        impl Hooks for H {
+            fn complete(&self, _line: &str, _pos: usize) -> (usize, Vec<Candidate>) {
+                let cand = |s: &str| Candidate {
+                    display: s.to_string(),
+                    replacement: s.to_string(),
+                };
+                (0, vec![cand("alpha"), cand("alphabet")])
+            }
+        }
+        let mut ring = VecDeque::new();
+        // Off (default): the first Tab only inserts the common prefix;
+        // the list waits for a second Tab (no progress next time).
+        let mut st = state_hooked("", 0, &H);
+        run_action(&mut st, EditorAction::Complete, &Key::Tab, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "alpha");
+        assert!(st.menu.is_none());
+        // On: the same first Tab both inserts the prefix and lists (arms
+        // the menu) right away.
+        let mut st = state_hooked("", 0, &H);
+        st.cfg.show_all_if_ambiguous = true;
+        run_action(&mut st, EditorAction::Complete, &Key::Tab, &[], &mut ring).unwrap();
+        assert_eq!(st.buffer, "alpha");
+        assert!(st.menu.is_some());
+    }
 }

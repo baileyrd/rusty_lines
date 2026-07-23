@@ -76,7 +76,13 @@ correctly, just unverified":
 Per the skill's stop conditions: no open (or filable) `parity-gap`
 issues exist after this assessment — rusty_lines is at full parity with
 its own hand-curated scope document. The loop ends here for this run;
-no issues were filed, no PRs opened. The test-coverage list above is
-left for the user to decide whether it's worth a separate body of work
-(it's a testing-conventions gap per CLAUDE.md's own testing section, not
-a parity gap per this skill's definition).
+no issues were filed, no PRs opened for capability work.
+
+The test-coverage list above was, per the user's direction, implemented
+directly in this same session rather than filed as separate issues:
+all 12 items now have unit or pty tests (see CHANGELOG.md's Unreleased
+entry for the full list). No production code changed — every one of the
+12 capabilities was already correct; only tests were added. Full local
+gate (`cargo build && cargo test && cargo clippy --all-targets -- -D
+warnings && cargo fmt --check`) is green: 83 unit tests, 43 pty tests, 1
+doctest.
